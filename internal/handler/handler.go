@@ -6,40 +6,123 @@ import (
 	"fmt"
 	"hash/fnv"
 	"net"
+	"net/url"
 	"os"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/GeertJohan/yubigo"
 	"github.com/glauth/glauth/v2/pkg/config"
 	"github.com/glauth/glauth/v2/pkg/handler"
 	"github.com/glauth/ldap"
 	"github.com/rs/zerolog"
+	"github.com/zitadel/zitadel-go/v3/pkg/client"
+	zit "github.com/zitadel/zitadel-go/v3/pkg/zitadel"
+	"google.golang.org/grpc"
 
-	"github.com/jacobalberty/zitadel-ldap/internal/zitadel"
+	apperrors "github.com/jacobalberty/zitadel-ldap/internal/errors"
+	"github.com/jacobalberty/zitadel-ldap/internal/repository"
+	"github.com/jacobalberty/zitadel-ldap/internal/stores/zitadel"
+	zclient "github.com/jacobalberty/zitadel-ldap/internal/zitadel"
+)
+
+const (
+	// defaultTimeout is the default timeout for Zitadel API calls
+	defaultTimeout = 30 * time.Second
 )
 
 type zitadelHandler struct {
-	options   handler.Options
-	ldohelper handler.LDAPOpsHelper
-	// tracer        trace.Tracer
-	zitadelClient *zitadel.Client
-	log           *zerolog.Logger
-	yubikeyAuth   *yubigo.YubiAuth
-	baseDN        string
+	options     handler.Options
+	ldohelper   handler.LDAPOpsHelper
+	repository  repository.Repository
+	log         *zerolog.Logger
+	yubikeyAuth *yubigo.YubiAuth
+	baseDN      string
 }
 
 // NewZitadelHandler creates a new instance of the zitadel backend
 func NewZitadelHandler(opts ...handler.Option) handler.Handler {
 	options := handler.NewOptions(opts...)
 
-	return &zitadelHandler{
-		options:       options,
-		ldohelper:     options.LDAPHelper,
-		log:           options.Logger,
-		yubikeyAuth:   options.YubiAuth,
-		zitadelClient: zitadel.NewClient(os.Getenv("ZITADEL_URL"), os.Getenv("ZITADEL_PAT"), HeadersFromEnv(os.Getenv("ZITADEL_REQUEST_HEADERS")), options.Logger),
-		baseDN:        options.Backend.BaseDN,
+	// Initialize Zitadel SDK client
+	repo, err := initializeRepository(options.Logger)
+	if err != nil {
+		options.Logger.Fatal().Err(err).Msg("Failed to initialize Zitadel repository")
 	}
+
+	return &zitadelHandler{
+		options:     options,
+		ldohelper:   options.LDAPHelper,
+		repository:  repo,
+		log:         options.Logger,
+		yubikeyAuth: options.YubiAuth,
+		baseDN:      options.Backend.BaseDN,
+	}
+}
+
+// initializeRepository creates a new Zitadel repository using the SDK
+func initializeRepository(logger *zerolog.Logger) (repository.Repository, error) {
+	zitadelURL := os.Getenv("ZITADEL_URL")
+	if zitadelURL == "" {
+		return nil, fmt.Errorf("ZITADEL_URL environment variable is required")
+	}
+
+	zitadelPAT := os.Getenv("ZITADEL_PAT")
+	if zitadelPAT == "" {
+		return nil, fmt.Errorf("ZITADEL_PAT environment variable is required")
+	}
+
+	authority := strings.TrimSpace(os.Getenv("ZITADEL_AUTHORITY"))
+
+	// Parse Zitadel URL
+	u, err := url.Parse(zitadelURL)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse ZITADEL_URL: %w", err)
+	}
+
+	// Configure Zitadel options
+	zitOpts := []zit.Option{}
+	if u.Port() != "" {
+		port, err := strconv.Atoi(u.Port())
+		if err != nil {
+			return nil, fmt.Errorf("invalid port in ZITADEL_URL: %w", err)
+		}
+		if port < 1 || port > 65535 {
+			return nil, fmt.Errorf("port out of range in ZITADEL_URL: %d", port)
+		}
+		if u.Scheme == "http" {
+			zitOpts = append(zitOpts, zit.WithInsecure(u.Port()))
+		} else {
+			zitOpts = append(zitOpts, zit.WithPort(uint16(port)))
+		}
+	} else if u.Scheme == "http" {
+		zitOpts = append(zitOpts, zit.WithInsecure("80"))
+	}
+
+	// Create Zitadel instance
+	zitInstance := zit.New(u.Hostname(), zitOpts...)
+
+	dialOpts := []grpc.DialOption{}
+	if authority != "" {
+		dialOpts = append(dialOpts, grpc.WithAuthority(authority))
+	}
+
+	// Create SDK client
+	zitClient, err := client.New(context.Background(), zitInstance,
+		client.WithAuth(client.PAT(zitadelPAT)),
+		client.WithGRPCDialOptions(dialOpts...))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create Zitadel client: %w", err)
+	}
+
+	// Create store and repository
+	store := zitadel.NewZitadelStore(zitClient)
+	repo := repository.NewZitadelRepository(store.GetQuerier())
+
+	logger.Info().Str("url", zitadelURL).Msg("Initialized Zitadel SDK client")
+
+	return repo, nil
 }
 
 func (z *zitadelHandler) Add(boundDN string, req ldap.AddRequest, conn net.Conn) (ldap.LDAPResultCode, error) {
@@ -47,31 +130,65 @@ func (z *zitadelHandler) Add(boundDN string, req ldap.AddRequest, conn net.Conn)
 }
 
 func (z *zitadelHandler) Bind(bindDN, bindSimplePw string, conn net.Conn) (ldap.LDAPResultCode, error) {
-	// _, span := z.tracer.Start(context.Background(), "plugins.zitadelHandler.Bind")
-	// defer span.End()
-
 	z.log.Info().Str("username", bindDN).Msg("trying to login")
 
-	userCN := strings.Split(bindDN, ",")[0]
-	user := strings.Split(userCN, "=")[1]
-
-	success, err := z.zitadelClient.Login(user, bindSimplePw)
-	if err != nil {
-		return ldap.LDAPResultInvalidCredentials, err
-	}
-
-	if success {
+	if strings.TrimSpace(bindDN) == "" {
+		z.log.Info().Msg("Anonymous bind accepted")
 		return ldap.LDAPResultSuccess, nil
 	}
 
+	// Parse DN with bounds checking
+	parts := strings.Split(bindDN, ",")
+	if len(parts) == 0 {
+		z.log.Warn().Str("bindDN", bindDN).Msg("Invalid DN: no parts")
+		return ldap.LDAPResultInvalidDNSyntax, fmt.Errorf("invalid DN: %s", bindDN)
+	}
+
+	userCN := parts[0]
+	cnParts := strings.Split(userCN, "=")
+	if len(cnParts) < 2 {
+		z.log.Warn().Str("bindDN", bindDN).Str("userCN", userCN).Msg("Invalid CN: no equals sign")
+		return ldap.LDAPResultInvalidDNSyntax, fmt.Errorf("invalid CN: %s", userCN)
+	}
+
+	user := cnParts[1]
+
+	// Create context with timeout
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
+	defer cancel()
+
+	success, err := z.repository.Login(ctx, user, bindSimplePw)
+	if err != nil {
+		// Check error type for better logging
+		if apperrors.IsUnauthorized(err) {
+			z.log.Info().Str("user", user).Msg("Invalid credentials")
+			return ldap.LDAPResultInvalidCredentials, nil
+		}
+		if apperrors.IsTimeout(err) {
+			z.log.Error().Err(err).Str("user", user).Msg("Login timeout")
+			return ldap.LDAPResultBusy, fmt.Errorf("authentication timeout: %w", err)
+		}
+		z.log.Error().Err(err).Str("user", user).Msg("Login error")
+		return ldap.LDAPResultOperationsError, fmt.Errorf("authentication failed: %w", err)
+	}
+
+	if success {
+		z.log.Info().Str("user", user).Msg("Login successful")
+		return ldap.LDAPResultSuccess, nil
+	}
+
+	z.log.Info().Str("user", user).Msg("Invalid credentials")
 	return ldap.LDAPResultInvalidCredentials, nil
 }
 
 func (z *zitadelHandler) Search(boundDN string, req ldap.SearchRequest, conn net.Conn) (ldap.ServerSearchResult, error) {
-	// ctx, span := z.tracer.Start(context.Background(), "plugins.zitadelHandler.Search")
-	// defer span.End()
 	z.log.Info().Str("backend", "zitadel").Str("user", boundDN).Msg("Doing a search")
-	return z.ldohelper.Search(context.Background(), z, boundDN, req, conn)
+
+	// Create context with timeout for search operations
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
+	defer cancel()
+
+	return z.ldohelper.Search(ctx, z, boundDN, req, conn)
 }
 
 func (z *zitadelHandler) Close(boundDN string, conn net.Conn) error {
@@ -87,22 +204,29 @@ func (z *zitadelHandler) Delete(boundDN, deleteDN string, conn net.Conn) (ldap.L
 }
 
 func (z *zitadelHandler) FindUser(ctx context.Context, userName string, searchByUPN bool) (bool, config.User, error) {
-
 	z.log.Info().Str("backend", "zitadel").Str("username", userName).Msg("Finding user")
 
-	var users *zitadel.UserResults
+	// Ensure context has a timeout
+	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, defaultTimeout)
+		defer cancel()
+	}
+
+	var users *zclient.UserResults
+	var err error
 	if searchByUPN {
-		tmp, err := z.zitadelClient.FindUserByMail(userName)
+		users, err = z.repository.FindUserByMail(ctx, userName)
 		if err != nil {
-			return false, config.User{}, err
+			z.log.Error().Err(err).Str("username", userName).Msg("Failed to find user by mail")
+			return false, config.User{}, fmt.Errorf("failed to find user by mail: %w", err)
 		}
-		users = tmp
 	} else {
-		tmp, err := z.zitadelClient.FindUserByName(userName)
+		users, err = z.repository.FindUserByName(ctx, userName)
 		if err != nil {
-			return false, config.User{}, err
+			z.log.Error().Err(err).Str("username", userName).Msg("Failed to find user by name")
+			return false, config.User{}, fmt.Errorf("failed to find user by name: %w", err)
 		}
-		users = tmp
 	}
 
 	if users == nil || len(users.Result) == 0 || len(users.Result) > 1 {
@@ -111,9 +235,9 @@ func (z *zitadelHandler) FindUser(ctx context.Context, userName string, searchBy
 
 	zUser := users.Result[0]
 
-	metadata, err := z.zitadelClient.ListMetadata(zUser.UserID)
+	metadata, err := z.repository.ListMetadata(ctx, zUser.UserID)
 	if err != nil {
-		return false, config.User{}, err
+		return false, config.User{}, fmt.Errorf("failed to list metadata: %w", err)
 	}
 
 	caps := []config.Capability{}
@@ -141,9 +265,9 @@ func (z *zitadelHandler) FindUser(ctx context.Context, userName string, searchBy
 
 	z.log.Debug().Str("user", zUser.Username).Int("caps", len(caps)).Msg("Found capabilities")
 
-	groups, err := z.getUserGroupIDs(zUser.UserID)
+	groups, err := z.getUserGroupIDs(ctx, zUser.UserID)
 	if err != nil {
-		return false, config.User{}, err
+		return false, config.User{}, fmt.Errorf("failed to get user groups: %w", err)
 	}
 
 	user := config.User{
@@ -162,15 +286,23 @@ func (z *zitadelHandler) FindUser(ctx context.Context, userName string, searchBy
 func (z *zitadelHandler) FindGroup(ctx context.Context, groupName string) (bool, config.Group, error) {
 	z.log.Info().Str("backend", "zitadel").Str("group", groupName).Msg("Finding groups")
 
-	projects, err := z.zitadelClient.ListProjects()
+	// Ensure context has a timeout
+	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, defaultTimeout)
+		defer cancel()
+	}
+
+	projects, err := z.repository.ListProjects(ctx)
 	if err != nil {
-		return false, config.Group{}, err
+		z.log.Error().Err(err).Msg("Failed to list projects")
+		return false, config.Group{}, fmt.Errorf("failed to list projects: %w", err)
 	}
 
 	for _, p := range projects.Result {
-		roles, err := z.zitadelClient.ListRoles(p.ID)
+		roles, err := z.repository.ListRoles(ctx, p.ID)
 		if err != nil {
-			return false, config.Group{}, err
+			return false, config.Group{}, fmt.Errorf("failed to list roles for project %s: %w", p.ID, err)
 		}
 
 		for _, r := range roles.Result {
@@ -193,15 +325,21 @@ func (z *zitadelHandler) GetCfg() *config.Config           { return z.options.Co
 func (z *zitadelHandler) GetYubikeyAuth() *yubigo.YubiAuth { return z.yubikeyAuth }
 
 func (z *zitadelHandler) FindPosixAccounts(ctx context.Context, hierarchy string) (entrylist []*ldap.Entry, err error) {
-	// _, span := z.tracer.Start(ctx, "handler.zitadelHandler.FindPosixAccounts")
-	// defer span.End()
 	z.log.Info().Str("backend", "zitadel").Str("posixAccount", hierarchy).Msg("Finding posixAccount")
+
+	// Ensure context has a timeout
+	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, defaultTimeout)
+		defer cancel()
+	}
 
 	entries := []*ldap.Entry{}
 
-	users, err := z.zitadelClient.ListUsers()
+	users, err := z.repository.ListUsers(ctx)
 	if err != nil {
-		return nil, err
+		z.log.Error().Err(err).Msg("Failed to list users for posix accounts")
+		return nil, fmt.Errorf("failed to list users: %w", err)
 	}
 
 	for _, u := range users.Result {
@@ -233,9 +371,9 @@ func (z *zitadelHandler) FindPosixAccounts(ctx context.Context, hierarchy string
 		attrs = append(attrs, &ldap.EntryAttribute{Name: "gecos", Values: []string{u.Username}})
 		attrs = append(attrs, &ldap.EntryAttribute{Name: "gidNumber", Values: []string{fmt.Sprintf("%d", z.hash("zitadel"))}})
 
-		groups, err := z.memberOf(u.UserID)
+		groups, err := z.memberOf(ctx, u.UserID)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("failed to get memberOf for user %s: %w", u.UserID, err)
 		}
 
 		attrs = append(attrs, &ldap.EntryAttribute{Name: "memberOf", Values: groups})
@@ -248,9 +386,9 @@ func (z *zitadelHandler) FindPosixAccounts(ctx context.Context, hierarchy string
 		attrs = append(attrs, &ldap.EntryAttribute{Name: "shadowMin", Values: []string{"-1"}})
 		attrs = append(attrs, &ldap.EntryAttribute{Name: "shadowWarning", Values: []string{"7"}})
 
-		metadata, err := z.zitadelClient.ListMetadata(u.UserID)
+		metadata, err := z.repository.ListMetadata(ctx, u.UserID)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("failed to list metadata for user %s: %w", u.UserID, err)
 		}
 
 		for _, m := range metadata.Result {
@@ -273,20 +411,27 @@ func (z *zitadelHandler) FindPosixAccounts(ctx context.Context, hierarchy string
 
 }
 func (z *zitadelHandler) FindPosixGroups(ctx context.Context, hierarchy string) (entrylist []*ldap.Entry, err error) {
-	// _, span := z.tracer.Start(ctx, "handler.zitadelHandler.FindPosixGroups")
-	// defer span.End()
 	z.log.Info().Str("backend", "zitadel").Str("hieararchy", hierarchy).Msg("Finding posixGroup")
+
+	// Ensure context has a timeout
+	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, defaultTimeout)
+		defer cancel()
+	}
 
 	asGroupOfUniqueNames := hierarchy == "ou=groups"
 
-	projects, err := z.zitadelClient.ListProjects()
+	projects, err := z.repository.ListProjects(ctx)
 	if err != nil {
-		return nil, err
+		z.log.Error().Err(err).Msg("Failed to list projects for posix groups")
+		return nil, fmt.Errorf("failed to list projects: %w", err)
 	}
 
-	grants, err := z.zitadelClient.ListGrants()
+	grants, err := z.repository.ListGrants(ctx)
 	if err != nil {
-		return nil, err
+		z.log.Error().Err(err).Msg("Failed to list grants for posix groups")
+		return nil, fmt.Errorf("failed to list grants: %w", err)
 	}
 
 	grantMap := map[string][]string{}
@@ -300,9 +445,9 @@ func (z *zitadelHandler) FindPosixGroups(ctx context.Context, hierarchy string) 
 	entries := []*ldap.Entry{}
 
 	for _, p := range projects.Result {
-		roles, err := z.zitadelClient.ListRoles(p.ID)
+		roles, err := z.repository.ListRoles(ctx, p.ID)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("failed to list roles for project %s: %w", p.ID, err)
 		}
 
 		for _, r := range roles.Result {
@@ -349,10 +494,10 @@ func (z *zitadelHandler) addUserHierarchy(user string, hierarchy string) string 
 	return fmt.Sprintf("%s=%s,ou=users,%s", z.options.Backend.NameFormat, user, z.baseDN)
 }
 
-func (z *zitadelHandler) memberOf(userID string) ([]string, error) {
-	grants, err := z.zitadelClient.ListGrants()
+func (z *zitadelHandler) memberOf(ctx context.Context, userID string) ([]string, error) {
+	grants, err := z.repository.ListGrants(ctx)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to list grants: %w", err)
 	}
 
 	groups := []string{}
@@ -369,12 +514,12 @@ func (z *zitadelHandler) memberOf(userID string) ([]string, error) {
 	return groups, nil
 }
 
-func (z *zitadelHandler) getUserGroupIDs(userID string) ([]int, error) {
+func (z *zitadelHandler) getUserGroupIDs(ctx context.Context, userID string) ([]int, error) {
 	groups := []int{}
 
-	grants, err := z.zitadelClient.ListGrants()
+	grants, err := z.repository.ListGrants(ctx)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to list grants: %w", err)
 	}
 
 	for _, g := range grants.Result {

@@ -203,7 +203,7 @@ func TestZitadelRepositoryDelegates(t *testing.T) {
 		t.Fatalf("expected CreateUser to be called with alice")
 	}
 
-	_ = repo.UpdateUser(ctx, "u1", &zclient.UserUpdateRequest{Email: stringPtr("alice@example.com")})
+	_ = repo.UpdateUser(ctx, "u1", &zclient.UserUpdateRequest{Email: new("alice@example.com")})
 	if !mq.updateUserCalled || mq.updateUserIDArg != "u1" {
 		t.Fatalf("expected UpdateUser to be called with u1")
 	}
@@ -222,8 +222,4 @@ func TestZitadelRepositoryDelegates(t *testing.T) {
 	if !mq.updateMetadataCalled || mq.updateMetadataIDArg != "u4" || mq.updateMetadataKeyArg != "gl_team" {
 		t.Fatalf("expected UpdateMetadata to be called with u4/gl_team")
 	}
-}
-
-func stringPtr(value string) *string {
-	return &value
 }

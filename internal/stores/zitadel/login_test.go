@@ -11,7 +11,8 @@ func TestHashLoginNoConcatenationCollision(t *testing.T) {
 
 func TestHashLoginDeterministicAndPasswordSensitive(t *testing.T) {
 	q := &querier{}
-	if q.hashLogin("bob", "pw") != q.hashLogin("bob", "pw") {
+	first, second := q.hashLogin("bob", "pw"), q.hashLogin("bob", "pw")
+	if first != second {
 		t.Fatal("hash must be stable within a process")
 	}
 	if q.hashLogin("bob", "pw") == q.hashLogin("bob", "pw2") {

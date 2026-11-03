@@ -466,8 +466,8 @@ func (z *zitadelHandler) FindPosixAccounts(ctx context.Context, hierarchy string
 		}
 
 		for _, m := range metadata.Result {
-			if strings.HasPrefix(m.Key, "gl_") {
-				key := strings.TrimPrefix(m.Key, "gl_")
+			if after, ok := strings.CutPrefix(m.Key, "gl_"); ok {
+				key := after
 				val, err := base64.StdEncoding.DecodeString(string(m.Value))
 				if err != nil {
 					z.log.Warn().Str("user", u.Username).Str("key", m.Key).Msg("Skipping metadata with invalid base64 value")
@@ -661,7 +661,7 @@ func (z *zitadelHandler) dynamicGroupEntries(ctx context.Context, hierarchy stri
 
 func (z *zitadelHandler) hash(s string) int {
 	h := fnv.New32a()
-	h.Write([]byte(s))
+	_, _ = h.Write([]byte(s)) // hash.Hash.Write never returns an error
 	return int(h.Sum32())
 }
 

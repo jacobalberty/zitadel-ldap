@@ -1,0 +1,17 @@
+version: "2"
+run:
+  timeout: 5m
+linters:
+  default: standard
+  enable:
+    - errcheck
+    - staticcheck
+    - gosec
+    - govet
+    - ineffassign
+    - unused
+  exclusions:
+    rules:
+      # Tests: allow weak randomness / unchecked errors in fixtures.
+      - path: _test\.go
+        linters: [gosec, errcheck]

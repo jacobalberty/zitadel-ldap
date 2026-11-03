@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"io"
+	"slices"
 	"testing"
 
 	"github.com/glauth/glauth/v2/pkg/config"
@@ -433,10 +434,8 @@ func entryHasAttr(entry *ldap.Entry, name, value string) bool {
 		if attr.Name != name {
 			continue
 		}
-		for _, v := range attr.Values {
-			if v == value {
-				return true
-			}
+		if slices.Contains(attr.Values, value) {
+			return true
 		}
 	}
 	return false

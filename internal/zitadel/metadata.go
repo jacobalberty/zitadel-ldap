@@ -2,7 +2,7 @@ package zitadel
 
 // MetadataResults contains paginated metadata query results
 type MetadataResults struct {
-	Details Details          `json:"details,omitempty"`
+	Details Details          `json:"details"`
 	Result  []MetadataResult `json:"result,omitempty"`
 }
 

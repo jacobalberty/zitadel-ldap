@@ -6,14 +6,14 @@ import (
 
 // UserResults contains paginated user query results
 type UserResults struct {
-	Details Details `json:"details,omitempty"`
+	Details Details `json:"details"`
 	Result  []User  `json:"result,omitempty"`
 }
 
 // Details contains pagination and timing information
 type Details struct {
 	TotalResult string    `json:"totalResult,omitempty"`
-	Timestamp   time.Time `json:"timestamp,omitempty"`
+	Timestamp   time.Time `json:"timestamp"`
 }
 
 // Profile represents a user's profile information
@@ -34,9 +34,9 @@ type Email struct {
 
 // Human represents a human user account
 type Human struct {
-	Profile         Profile   `json:"profile,omitempty"`
-	Email           Email     `json:"email,omitempty"`
-	PasswordChanged time.Time `json:"passwordChanged,omitempty"`
+	Profile         Profile   `json:"profile"`
+	Email           Email     `json:"email"`
+	PasswordChanged time.Time `json:"passwordChanged"`
 	Groups          []string  `json:"groups,omitempty"`
 }
 

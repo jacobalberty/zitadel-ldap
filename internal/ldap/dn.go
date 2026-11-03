@@ -104,11 +104,11 @@ func escapeDNComponent(value string) string {
 			result.WriteString(`\#`)
 		case specialChars[r]:
 			// Escape special characters
-			result.WriteString(fmt.Sprintf("\\%c", r))
+			fmt.Fprintf(&result, "\\%c", r)
 		case r < 0x20 || r > 0x7E:
 			// Escape non-ASCII and control characters by UTF-8 bytes
 			for _, b := range []byte(string(r)) {
-				result.WriteString(fmt.Sprintf("\\%02x", b))
+				fmt.Fprintf(&result, "\\%02x", b)
 			}
 		default:
 			result.WriteRune(r)

@@ -89,7 +89,12 @@ jobs:
         if: github.event_name == 'workflow_dispatch'
         run: |
           if git rev-parse -q --verify "refs/tags/$VERSION" >/dev/null; then
-            echo "::error::Tag $VERSION already exists"
+            # Allow re-running a release whose tag was already created for this commit
+            if [ "$(git rev-parse "$VERSION^{commit}")" = "$(git rev-parse HEAD)" ]; then
+              echo "Tag $VERSION already exists at HEAD, reusing it"
+              exit 0
+            fi
+            echo "::error::Tag $VERSION already exists at a different commit"
             exit 1
           fi
           git config user.name "github-actions[bot]"
@@ -99,19 +104,19 @@ jobs:
 
       - name: Generate changelog from conventional commits
         id: changelog
-        uses: requarks/changelog-action@v1
+        uses: orhun/git-cliff-action@v4
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          tag: ${{ env.VERSION }}
-          writeToFile: false
-          includeInvalidCommits: true
+          # Built-in config groups conventional commits; works with no prior tag.
+          args: --current --strip header
+        env:
+          OUTPUT: RELEASE_NOTES.md
 
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.VERSION }}
           name: ${{ env.VERSION }}
-          body: ${{ steps.changelog.outputs.changes }}
+          body: ${{ steps.changelog.outputs.content }}
           prerelease: ${{ contains(env.VERSION, '-') }}
 
   docker:

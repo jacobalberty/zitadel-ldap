@@ -34,6 +34,18 @@ To add capability `search *` to a user, set metadata `cap_search` with the value
 
 To add a custom field called `test` to a user, set the metadata `gl_test` with any desired value.
 
+### Security options
+
+| Variable | Default | Effect |
+|---|---|---|
+| `ZITADEL_LDAP_ENABLE_WRITES` | `false` | Enables LDAP Add/Modify/Delete. When off, every write returns `insufficientAccessRights`. |
+| `ZITADEL_LDAP_ALLOW_ANONYMOUS_BIND` | `true` | Set to `false` to reject anonymous binds. |
+| `ZITADEL_LDAP_LOGIN_CACHE_TTL` | `60s` | How long a *successful* bind is cached (Go duration; `0` disables). Failures are never cached. |
+
+Writes also require the bound user to have the `cap_write` metadata (value `*`), and the target DN must be
+`cn=<user>,ou=users,<baseDN>`. Writes act with the service account's privileges, so grant `cap_write` sparingly.
+Empty-password binds are rejected.
+
 ### Dynamic groups (filter-based)
 
 You can define dynamic groups in the config by attaching a `dynamicFilter` capability to a group.

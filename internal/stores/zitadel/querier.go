@@ -38,7 +38,7 @@ type querier struct {
 func newQuerier(client *client.Client) Querier {
 	return &querier{
 		zitadelClient: client,
-		loginCache:    cache.NewCacher[CacheKey, bool](),
+		loginCache:    cache.NewCacher(cache.WithTTL[CacheKey, bool](loginCacheTTL()), cache.WithCapacity[CacheKey, bool](1000)),
 		usersCache:    cache.NewCacher[CacheKey, *zclient.UserResults](),
 		grantsCache:   cache.NewCacher[CacheKey, *zclient.GrantResults](),
 		projectsCache: cache.NewCacher[CacheKey, *zclient.ProjectResults](),

@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"time"
@@ -22,6 +23,7 @@ import (
 	"google.golang.org/grpc"
 
 	apperrors "github.com/jacobalberty/zitadel-ldap/internal/errors"
+	ldaputil "github.com/jacobalberty/zitadel-ldap/internal/ldap"
 	"github.com/jacobalberty/zitadel-ldap/internal/repository"
 	"github.com/jacobalberty/zitadel-ldap/internal/stores/zitadel"
 	zclient "github.com/jacobalberty/zitadel-ldap/internal/zitadel"
@@ -59,6 +61,11 @@ type zitadelHandler struct {
 	log         *zerolog.Logger
 	yubikeyAuth *yubigo.YubiAuth
 	baseDN      string
+
+	// writesEnabled gates Add/Modify/Delete (ZITADEL_LDAP_ENABLE_WRITES).
+	writesEnabled bool
+	// denyAnonymousBind rejects anonymous binds (ZITADEL_LDAP_ALLOW_ANONYMOUS_BIND=false).
+	denyAnonymousBind bool
 }
 
 // NewZitadelHandler creates a new instance of the zitadel backend
@@ -78,6 +85,9 @@ func NewZitadelHandler(opts ...handler.Option) handler.Handler {
 		log:         options.Logger,
 		yubikeyAuth: options.YubiAuth,
 		baseDN:      options.Backend.BaseDN,
+
+		writesEnabled:     envBool(envEnableWrites, false),
+		denyAnonymousBind: !envBool(envAllowAnonymousBind, true),
 	}
 }
 
@@ -145,29 +155,38 @@ func initializeRepository(logger *zerolog.Logger) (repository.Repository, error)
 	return repo, nil
 }
 
-func (z *zitadelHandler) Bind(bindDN, bindSimplePw string, conn net.Conn) (ldap.LDAPResultCode, error) {
-	z.log.Info().Str("username", bindDN).Msg("trying to login")
+func (z *zitadelHandler) Bind(bindDN, bindSimplePw string, conn net.Conn) (code ldap.LDAPResultCode, err error) {
+	defer z.recoverOp("Bind", &code, &err)
+
+	z.log.Debug().Str("bindDN", bindDN).Msg("trying to login")
 
 	if strings.TrimSpace(bindDN) == "" {
+		if z.denyAnonymousBind {
+			z.log.Info().Msg("Anonymous bind rejected")
+			return ldap.LDAPResultInappropriateAuthentication, nil
+		}
 		z.log.Info().Msg("Anonymous bind accepted")
 		return ldap.LDAPResultSuccess, nil
 	}
 
-	// Parse DN with bounds checking
-	parts := strings.Split(bindDN, ",")
-	if len(parts) == 0 {
-		z.log.Warn().Str("bindDN", bindDN).Msg("Invalid DN: no parts")
-		return ldap.LDAPResultInvalidDNSyntax, fmt.Errorf("invalid DN: %s", bindDN)
+	// RFC 4513 5.1.2: a DN with an empty password is an "unauthenticated
+	// bind" and must not be treated as a successful authentication.
+	if bindSimplePw == "" {
+		z.log.Info().Msg("Bind rejected: empty password")
+		return ldap.LDAPResultUnwillingToPerform, fmt.Errorf("empty password not allowed")
 	}
 
-	userCN := parts[0]
-	cnParts := strings.Split(userCN, "=")
-	if len(cnParts) < 2 {
-		z.log.Warn().Str("bindDN", bindDN).Str("userCN", userCN).Msg("Invalid CN: no equals sign")
-		return ldap.LDAPResultInvalidDNSyntax, fmt.Errorf("invalid CN: %s", userCN)
+	parsedDN, err := ldaputil.ParseAndValidateDN(bindDN)
+	if err != nil {
+		z.log.Warn().Err(err).Msg("Invalid bind DN")
+		return ldap.LDAPResultInvalidDNSyntax, fmt.Errorf("invalid DN")
 	}
-
-	user := cnParts[1]
+	first := parsedDN.RDNs[0]
+	if len(first.Attributes) == 0 || first.Attributes[0].Value == "" {
+		z.log.Warn().Msg("Invalid bind DN: empty leading RDN")
+		return ldap.LDAPResultInvalidDNSyntax, fmt.Errorf("invalid DN")
+	}
+	user := first.Attributes[0].Value
 
 	// Create context with timeout
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
@@ -197,7 +216,15 @@ func (z *zitadelHandler) Bind(bindDN, bindSimplePw string, conn net.Conn) (ldap.
 	return ldap.LDAPResultInvalidCredentials, nil
 }
 
-func (z *zitadelHandler) Search(boundDN string, req ldap.SearchRequest, conn net.Conn) (ldap.ServerSearchResult, error) {
+func (z *zitadelHandler) Search(boundDN string, req ldap.SearchRequest, conn net.Conn) (result ldap.ServerSearchResult, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			z.log.Error().Interface("panic", r).Bytes("stack", debug.Stack()).Msg("Recovered from panic in Search")
+			result = ldap.ServerSearchResult{ResultCode: ldap.LDAPResultOperationsError}
+			err = fmt.Errorf("internal error in Search")
+		}
+	}()
+
 	z.log.Info().Str("backend", "zitadel").Str("user", boundDN).Msg("Doing a search")
 
 	// Create context with timeout for search operations

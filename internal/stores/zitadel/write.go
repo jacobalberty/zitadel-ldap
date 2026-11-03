@@ -132,6 +132,9 @@ func (q *querier) UpdateUser(ctx context.Context, userID string, req *zclient.Us
 		return fmt.Errorf("user ID cannot be empty")
 	}
 
+	// Cached logins may be stale after any (even partially failed) update.
+	defer q.loginCache.Clear()
+
 	// Build the Zitadel request
 	updateReq := &userv2.UpdateUserRequest{
 		UserId: userID,
@@ -230,6 +233,7 @@ func (q *querier) UpdateUser(ctx context.Context, userID string, req *zclient.Us
 	}
 
 	// Invalidate caches
+	q.loginCache.Clear()
 	q.usersCache = cache.NewCacher[CacheKey, *zclient.UserResults]()
 	q.metadataCache = cache.NewCacher[CacheKey, *zclient.MetadataResults]()
 
@@ -259,6 +263,7 @@ func (q *querier) DeleteUser(ctx context.Context, userID string) error {
 	}
 
 	// Invalidate caches
+	q.loginCache.Clear()
 	q.usersCache = cache.NewCacher[CacheKey, *zclient.UserResults]()
 	q.grantsCache = cache.NewCacher[CacheKey, *zclient.GrantResults]()
 	q.metadataCache = cache.NewCacher[CacheKey, *zclient.MetadataResults]()
@@ -298,7 +303,7 @@ func (q *querier) SetUserPassword(ctx context.Context, userID, password string) 
 	}
 
 	// Invalidate login cache
-	q.loginCache = cache.NewCacher[CacheKey, bool]()
+	q.loginCache.Clear()
 
 	return nil
 }

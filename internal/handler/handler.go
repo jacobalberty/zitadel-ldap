@@ -27,6 +27,26 @@ import (
 	zclient "github.com/jacobalberty/zitadel-ldap/internal/zitadel"
 )
 
+func upperDNAttributeTypes(dn string) string {
+	if dn == "" {
+		return dn
+	}
+
+	parts := strings.Split(dn, ",")
+	for i, part := range parts {
+		p := strings.TrimSpace(part)
+		kv := strings.SplitN(p, "=", 2)
+		if len(kv) != 2 {
+			parts[i] = p
+			continue
+		}
+
+		parts[i] = strings.ToUpper(strings.TrimSpace(kv[0])) + "=" + kv[1]
+	}
+
+	return strings.Join(parts, ",")
+}
+
 const (
 	// defaultTimeout is the default timeout for Zitadel API calls
 	defaultTimeout = 30 * time.Second
@@ -78,7 +98,7 @@ func initializeRepository(logger *zerolog.Logger) (repository.Repository, error)
 	// Parse Zitadel URL
 	u, err := url.Parse(zitadelURL)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse ZITADEL_URL: %w", err)
+		return nil, fmt.Errorf("invalid ZITADEL_URL format: %w", err)
 	}
 
 	// Configure Zitadel options
@@ -123,10 +143,6 @@ func initializeRepository(logger *zerolog.Logger) (repository.Repository, error)
 	logger.Info().Str("url", zitadelURL).Msg("Initialized Zitadel SDK client")
 
 	return repo, nil
-}
-
-func (z *zitadelHandler) Add(boundDN string, req ldap.AddRequest, conn net.Conn) (ldap.LDAPResultCode, error) {
-	return ldap.LDAPResultInsufficientAccessRights, nil
 }
 
 func (z *zitadelHandler) Bind(bindDN, bindSimplePw string, conn net.Conn) (ldap.LDAPResultCode, error) {
@@ -193,14 +209,6 @@ func (z *zitadelHandler) Search(boundDN string, req ldap.SearchRequest, conn net
 
 func (z *zitadelHandler) Close(boundDN string, conn net.Conn) error {
 	return nil
-}
-
-func (z *zitadelHandler) Modify(boundDN string, req ldap.ModifyRequest, conn net.Conn) (ldap.LDAPResultCode, error) {
-	return ldap.LDAPResultInsufficientAccessRights, nil
-}
-
-func (z *zitadelHandler) Delete(boundDN, deleteDN string, conn net.Conn) (ldap.LDAPResultCode, error) {
-	return ldap.LDAPResultInsufficientAccessRights, nil
 }
 
 func (z *zitadelHandler) FindUser(ctx context.Context, userName string, searchByUPN bool) (bool, config.User, error) {
@@ -349,6 +357,7 @@ func (z *zitadelHandler) FindPosixAccounts(ctx context.Context, hierarchy string
 		}
 
 		attrs := []*ldap.EntryAttribute{}
+		attrs = append(attrs, &ldap.EntryAttribute{Name: "uid", Values: []string{u.Username}})
 		attrs = append(attrs, &ldap.EntryAttribute{Name: "cn", Values: []string{u.Username}})
 		attrs = append(attrs, &ldap.EntryAttribute{Name: "givenName", Values: []string{u.Human.Profile.GivenName}})
 		attrs = append(attrs, &ldap.EntryAttribute{Name: "sn", Values: []string{u.Human.Profile.FamilyName}})
@@ -402,13 +411,43 @@ func (z *zitadelHandler) FindPosixAccounts(ctx context.Context, hierarchy string
 			}
 		}
 
-		dn := fmt.Sprintf("%s=%s,%s,%s", z.options.Backend.NameFormat, u.Username, hierarchy, z.baseDN)
+		dn := upperDNAttributeTypes(fmt.Sprintf("%s=%s,%s,%s", z.options.Backend.NameFormat, u.Username, hierarchy, z.baseDN))
 
-		entries = append(entries, &ldap.Entry{DN: dn, Attributes: attrs})
+		entries = append(entries, &ldap.Entry{DN: dn, Attributes: nonEmptyAttrs(attrs)})
 	}
 
 	return entries, nil
 
+}
+
+// nonEmptyAttrs sanitizes entry attributes so they don't break strict LDAP
+// clients. jellyfin-plugin-ldapauth's admin-filter search requests all
+// attributes, and the Novell.Directory.Ldap client mishandles entries that
+// carry an attribute with empty/blank values (NullReferenceException) or with
+// duplicate values (a malformed value set, which makes it hang while decoding).
+// For each attribute we drop blank values and collapse duplicates, and we omit
+// the attribute entirely when nothing usable remains.
+func nonEmptyAttrs(in []*ldap.EntryAttribute) []*ldap.EntryAttribute {
+	out := make([]*ldap.EntryAttribute, 0, len(in))
+	for _, a := range in {
+		vals := make([]string, 0, len(a.Values))
+		seen := make(map[string]struct{}, len(a.Values))
+		for _, v := range a.Values {
+			if strings.TrimSpace(v) == "" {
+				continue
+			}
+			if _, dup := seen[v]; dup {
+				continue
+			}
+			seen[v] = struct{}{}
+			vals = append(vals, v)
+		}
+		if len(vals) == 0 {
+			continue
+		}
+		out = append(out, &ldap.EntryAttribute{Name: a.Name, Values: vals})
+	}
+	return out
 }
 func (z *zitadelHandler) FindPosixGroups(ctx context.Context, hierarchy string) (entrylist []*ldap.Entry, err error) {
 	z.log.Info().Str("backend", "zitadel").Str("hieararchy", hierarchy).Msg("Finding posixGroup")
@@ -420,7 +459,7 @@ func (z *zitadelHandler) FindPosixGroups(ctx context.Context, hierarchy string) 
 		defer cancel()
 	}
 
-	asGroupOfUniqueNames := hierarchy == "ou=groups"
+	asGroupOfUniqueNames := strings.EqualFold(hierarchy, "ou=groups")
 
 	projects, err := z.repository.ListProjects(ctx)
 	if err != nil {
@@ -438,7 +477,7 @@ func (z *zitadelHandler) FindPosixGroups(ctx context.Context, hierarchy string) 
 
 	for _, g := range grants.Result {
 		for _, r := range g.RoleKeys {
-			grantMap[g.ProjectName+r] = append(grantMap[g.ProjectName+r], z.addUserHierarchy(g.UserName, hierarchy))
+			grantMap[g.ProjectName+r] = append(grantMap[g.ProjectName+r], z.addUserHierarchy(g.UserName, "ou=users"))
 		}
 	}
 
@@ -455,7 +494,7 @@ func (z *zitadelHandler) FindPosixGroups(ctx context.Context, hierarchy string) 
 			groupKey := p.Name + r.Group
 
 			attrs := []*ldap.EntryAttribute{}
-			attrs = append(attrs, &ldap.EntryAttribute{Name: "cn", Values: []string{r.Group}})
+			attrs = append(attrs, &ldap.EntryAttribute{Name: "CN", Values: []string{r.Group}})
 			attrs = append(attrs, &ldap.EntryAttribute{Name: "description", Values: []string{fmt.Sprintf("%s via Zitadel", r.Group)}})
 			attrs = append(attrs, &ldap.EntryAttribute{Name: "gidNumber", Values: []string{fmt.Sprintf("%d", z.hash(groupKey))}})
 			attrs = append(attrs, &ldap.EntryAttribute{Name: "uniqueMember", Values: grantMap[groupKey]})
@@ -471,8 +510,9 @@ func (z *zitadelHandler) FindPosixGroups(ctx context.Context, hierarchy string) 
 			if hierarchy != "" {
 				dn = fmt.Sprintf("%s=%s,%s,%s", z.options.Backend.GroupFormat, r.Group, hierarchy, z.baseDN)
 			}
+			dn = upperDNAttributeTypes(dn)
 
-			entries = append(entries, &ldap.Entry{DN: dn, Attributes: attrs})
+			entries = append(entries, &ldap.Entry{DN: dn, Attributes: nonEmptyAttrs(attrs)})
 		}
 
 	}
@@ -489,9 +529,9 @@ func (z *zitadelHandler) hash(s string) int {
 
 func (z *zitadelHandler) addUserHierarchy(user string, hierarchy string) string {
 	if hierarchy != "" {
-		return fmt.Sprintf("%s=%s,%s,%s", z.options.Backend.NameFormat, user, hierarchy, z.baseDN)
+		return upperDNAttributeTypes(fmt.Sprintf("%s=%s,%s,%s", z.options.Backend.NameFormat, user, hierarchy, z.baseDN))
 	}
-	return fmt.Sprintf("%s=%s,ou=users,%s", z.options.Backend.NameFormat, user, z.baseDN)
+	return upperDNAttributeTypes(fmt.Sprintf("%s=%s,OU=users,%s", z.options.Backend.NameFormat, user, z.baseDN))
 }
 
 func (z *zitadelHandler) memberOf(ctx context.Context, userID string) ([]string, error) {

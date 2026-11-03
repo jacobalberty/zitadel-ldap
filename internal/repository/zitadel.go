@@ -59,5 +59,30 @@ func (r *ZitadelRepository) Login(ctx context.Context, username, password string
 	return r.querier.Login(ctx, username, password)
 }
 
+// CreateUser creates a new human user
+func (r *ZitadelRepository) CreateUser(ctx context.Context, req *zclient.UserCreateRequest) (*zclient.User, error) {
+	return r.querier.CreateUser(ctx, req)
+}
+
+// UpdateUser updates an existing user
+func (r *ZitadelRepository) UpdateUser(ctx context.Context, userID string, req *zclient.UserUpdateRequest) error {
+	return r.querier.UpdateUser(ctx, userID, req)
+}
+
+// DeleteUser deletes an existing user
+func (r *ZitadelRepository) DeleteUser(ctx context.Context, userID string) error {
+	return r.querier.DeleteUser(ctx, userID)
+}
+
+// SetUserPassword updates a user's password
+func (r *ZitadelRepository) SetUserPassword(ctx context.Context, userID, password string) error {
+	return r.querier.SetUserPassword(ctx, userID, password)
+}
+
+// UpdateMetadata sets or updates a metadata key for a user
+func (r *ZitadelRepository) UpdateMetadata(ctx context.Context, userID, key string, value []byte) error {
+	return r.querier.UpdateMetadata(ctx, userID, key, value)
+}
+
 // Ensure ZitadelRepository implements Repository interface
 var _ Repository = (*ZitadelRepository)(nil)

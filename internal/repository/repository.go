@@ -45,6 +45,24 @@ type AuthRepository interface {
 	Login(ctx context.Context, username, password string) (bool, error)
 }
 
+// WriteRepository defines user write operations
+type WriteRepository interface {
+	// CreateUser creates a new human user
+	CreateUser(ctx context.Context, req *zclient.UserCreateRequest) (*zclient.User, error)
+
+	// UpdateUser updates an existing user
+	UpdateUser(ctx context.Context, userID string, req *zclient.UserUpdateRequest) error
+
+	// DeleteUser deletes an existing user
+	DeleteUser(ctx context.Context, userID string) error
+
+	// SetUserPassword updates a user's password
+	SetUserPassword(ctx context.Context, userID, password string) error
+
+	// UpdateMetadata sets or updates a metadata key for a user
+	UpdateMetadata(ctx context.Context, userID, key string, value []byte) error
+}
+
 // Repository aggregates all repository interfaces
 type Repository interface {
 	UserRepository
@@ -52,4 +70,5 @@ type Repository interface {
 	ProjectRepository
 	MetadataRepository
 	AuthRepository
+	WriteRepository
 }

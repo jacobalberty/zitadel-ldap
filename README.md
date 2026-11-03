@@ -34,6 +34,22 @@ To add capability `search *` to a user, set metadata `cap_search` with the value
 
 To add a custom field called `test` to a user, set the metadata `gl_test` with any desired value.
 
+### Dynamic groups (filter-based)
+
+You can define dynamic groups in the config by attaching a `dynamicFilter` capability to a group.
+The filter is evaluated against user attributes and decoded metadata (including `gl_` keys).
+
+Example:
+
+```toml
+[[groups]]
+	name = "eng"
+	gidnumber = 9001
+	[[groups.capabilities]]
+		action = "dynamicFilter"
+		object = "(gl_department=engineering)"
+```
+
 The plugin will only show human users in the LDAP queries!
 
 > [!CAUTION]

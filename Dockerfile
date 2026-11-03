@@ -1,4 +1,4 @@
-FROM --platform=$BUILDPLATFORM golang:1.25 AS build
+FROM --platform=$BUILDPLATFORM golang:1.26 AS build
 
 WORKDIR /app
 
@@ -17,7 +17,7 @@ RUN go build -trimpath -tags noembed -ldflags "-s -w" -o ./bin -buildvcs=false g
 
 COPY . ./
 
-RUN CGO_ENABLED=1 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath -tags noembed -ldflags "-s -w" -buildmode=plugin -o ./bin -buildvcs=false ./lib/...
+RUN CGO_ENABLED=1 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath -tags noembed,plugin -ldflags "-s -w" -buildmode=plugin -o ./bin -buildvcs=false ./lib/...
 
 FROM gcr.io/distroless/base-debian13
 

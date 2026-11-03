@@ -18,6 +18,11 @@ type Querier interface {
 	ListUsers(ctx context.Context) (*zclient.UserResults, error)
 	FindUserByName(ctx context.Context, name string) (*zclient.UserResults, error)
 	FindUserByMail(ctx context.Context, mail string) (*zclient.UserResults, error)
+	CreateUser(ctx context.Context, req *zclient.UserCreateRequest) (*zclient.User, error)
+	UpdateUser(ctx context.Context, userID string, req *zclient.UserUpdateRequest) error
+	DeleteUser(ctx context.Context, userID string) error
+	SetUserPassword(ctx context.Context, userID, password string) error
+	UpdateMetadata(ctx context.Context, userID, key string, value []byte) error
 }
 
 type querier struct {

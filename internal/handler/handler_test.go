@@ -25,6 +25,11 @@ type mockRepository struct {
 	listRolesFn      func(ctx context.Context, projectID string) (*zclient.RoleResults, error)
 	listUsersFn      func(ctx context.Context) (*zclient.UserResults, error)
 	listGrantsFn     func(ctx context.Context) (*zclient.GrantResults, error)
+	createUserFn     func(ctx context.Context, req *zclient.UserCreateRequest) (*zclient.User, error)
+	updateUserFn     func(ctx context.Context, userID string, req *zclient.UserUpdateRequest) error
+	deleteUserFn     func(ctx context.Context, userID string) error
+	setPasswordFn    func(ctx context.Context, userID, password string) error
+	updateMetadataFn func(ctx context.Context, userID, key string, value []byte) error
 }
 
 func (m *mockRepository) ListUsers(ctx context.Context) (*zclient.UserResults, error) {
@@ -81,6 +86,41 @@ func (m *mockRepository) Login(ctx context.Context, username, password string) (
 		return false, nil
 	}
 	return m.loginFn(ctx, username, password)
+}
+
+func (m *mockRepository) CreateUser(ctx context.Context, req *zclient.UserCreateRequest) (*zclient.User, error) {
+	if m.createUserFn == nil {
+		return nil, nil
+	}
+	return m.createUserFn(ctx, req)
+}
+
+func (m *mockRepository) UpdateUser(ctx context.Context, userID string, req *zclient.UserUpdateRequest) error {
+	if m.updateUserFn == nil {
+		return nil
+	}
+	return m.updateUserFn(ctx, userID, req)
+}
+
+func (m *mockRepository) DeleteUser(ctx context.Context, userID string) error {
+	if m.deleteUserFn == nil {
+		return nil
+	}
+	return m.deleteUserFn(ctx, userID)
+}
+
+func (m *mockRepository) SetUserPassword(ctx context.Context, userID, password string) error {
+	if m.setPasswordFn == nil {
+		return nil
+	}
+	return m.setPasswordFn(ctx, userID, password)
+}
+
+func (m *mockRepository) UpdateMetadata(ctx context.Context, userID, key string, value []byte) error {
+	if m.updateMetadataFn == nil {
+		return nil
+	}
+	return m.updateMetadataFn(ctx, userID, key, value)
 }
 
 var _ repository.Repository = (*mockRepository)(nil)
@@ -238,12 +278,12 @@ func TestAddUserHierarchy(t *testing.T) {
 	h := newTestHandler(&mockRepository{})
 
 	withHierarchy := h.addUserHierarchy("alice", "ou=staff")
-	if withHierarchy != "cn=alice,ou=staff,dc=example,dc=com" {
+	if withHierarchy != "CN=alice,OU=staff,DC=example,DC=com" {
 		t.Fatalf("unexpected hierarchy DN: %s", withHierarchy)
 	}
 
 	withoutHierarchy := h.addUserHierarchy("alice", "")
-	if withoutHierarchy != "cn=alice,ou=users,dc=example,dc=com" {
+	if withoutHierarchy != "CN=alice,OU=users,DC=example,DC=com" {
 		t.Fatalf("unexpected default DN: %s", withoutHierarchy)
 	}
 }
@@ -273,6 +313,47 @@ func TestMemberOfAndGroupIDs(t *testing.T) {
 	}
 	if len(ids) != 2 {
 		t.Fatalf("expected 2 group IDs, got %d", len(ids))
+	}
+}
+
+func TestDynamicMemberOf(t *testing.T) {
+	encoded := base64.StdEncoding.EncodeToString([]byte("engineering"))
+	h := newTestHandler(&mockRepository{})
+	h.options.Config = &config.Config{
+		Groups: []config.Group{
+			{
+				Name:      "eng",
+				GIDNumber: 9001,
+				Capabilities: []config.Capability{
+					{
+						Action: "dynamicFilter",
+						Object: "(gl_department=engineering)",
+					},
+				},
+			},
+		},
+	}
+
+	user := zclient.User{
+		UserID:   "u1",
+		Username: "alice",
+		State:    "USER_STATE_ACTIVE",
+		Human: &zclient.Human{
+			Profile: zclient.Profile{GivenName: "Alice", FamilyName: "Doe"},
+			Email:   zclient.Email{Email: "alice@example.com"},
+		},
+	}
+
+	metadata := &zclient.MetadataResults{Result: []zclient.MetadataResult{
+		{Key: "gl_department", Value: encoded},
+	}}
+
+	groups, err := h.dynamicMemberOf(user, metadata)
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if len(groups) != 1 {
+		t.Fatalf("expected 1 dynamic group, got %d", len(groups))
 	}
 }
 

@@ -17,6 +17,8 @@ type LoaderFunc[V any] func(ctx context.Context) (V, error)
 type Cacher[K comparable, V any] interface {
 	Get(ctx context.Context, key K, loaderFunc LoaderFunc[V]) (V, error)
 	GetMany(ctx context.Context, keys []K, loaderFunc LoaderFunc[map[K]V]) (map[K]V, error)
+	// Clear discards every entry. It is safe for concurrent use.
+	Clear()
 }
 
 type cacher[K comparable, V any] struct {
@@ -90,4 +92,11 @@ func (c *cacher[K, V]) GetMany(ctx context.Context, keys []K, loaderFunc LoaderF
 	}
 
 	return result, nil
+}
+
+// Clear discards all entries.
+func (c *cacher[K, V]) Clear() {
+	if c.cache != nil {
+		c.cache.InvalidateAll()
+	}
 }

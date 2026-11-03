@@ -8,7 +8,6 @@ import (
 	"strings"
 
 	"github.com/glauth/ldap"
-	ldaputil "github.com/jacobalberty/zitadel-ldap/internal/ldap"
 	zclient "github.com/jacobalberty/zitadel-ldap/internal/zitadel"
 )
 
@@ -80,47 +79,57 @@ func (z *zitadelHandler) processCreateAttributes(attrType string, attrVals []str
 	}
 }
 
-// extractAddRequestFields uses reflection to access unexported AddRequest fields
-func (z *zitadelHandler) extractAddRequestFields(req ldap.AddRequest) (string, []interface{}, error) {
-	dnVal := reflect.ValueOf(req).FieldByName("dn")
-	if !dnVal.IsValid() {
+// extractAddRequestFields reads the unexported fields of ldap.AddRequest via
+// reflection. It deliberately never calls Interface() on the values: that
+// panics for values obtained through unexported fields. String()/Len()/Index()
+// are permitted on them.
+func (z *zitadelHandler) extractAddRequestFields(req ldap.AddRequest) (string, []reflect.Value, error) {
+	v := reflect.ValueOf(req)
+	dnVal := v.FieldByName("dn")
+	if !dnVal.IsValid() || dnVal.Kind() != reflect.String {
 		return "", nil, fmt.Errorf("cannot access DN from AddRequest")
 	}
 	dn := dnVal.String()
 
-	attrsVal := reflect.ValueOf(req).FieldByName("attributes")
-	if !attrsVal.IsValid() {
+	attrsVal := v.FieldByName("attributes")
+	if !attrsVal.IsValid() || attrsVal.Kind() != reflect.Slice {
 		return dn, nil, fmt.Errorf("cannot access attributes from AddRequest")
 	}
 
-	var attrs []interface{}
-	if attrsVal.Kind() == reflect.Slice {
-		for i := 0; i < attrsVal.Len(); i++ {
-			attrs = append(attrs, attrsVal.Index(i).Interface())
-		}
+	attrs := make([]reflect.Value, 0, attrsVal.Len())
+	for i := 0; i < attrsVal.Len(); i++ {
+		attrs = append(attrs, attrsVal.Index(i))
 	}
 
 	return dn, attrs, nil
 }
 
-// getAttributeTypeAndVals extracts type and values from a reflected Attribute
-func (z *zitadelHandler) getAttributeTypeAndVals(attr interface{}) (string, []string) {
-	attrVal := reflect.ValueOf(attr)
-	attrType := reflect.Indirect(attrVal).FieldByName("attrType").String()
-	attrValsField := reflect.Indirect(attrVal).FieldByName("attrVals")
+// getAttributeTypeAndVals extracts type and values from a reflected Attribute.
+func (z *zitadelHandler) getAttributeTypeAndVals(attr reflect.Value) (string, []string) {
+	attr = reflect.Indirect(attr)
+	if attr.Kind() != reflect.Struct {
+		return "", nil
+	}
+	typeField := attr.FieldByName("attrType")
+	valsField := attr.FieldByName("attrVals")
+	if !typeField.IsValid() || typeField.Kind() != reflect.String {
+		return "", nil
+	}
 
 	var vals []string
-	if attrValsField.Kind() == reflect.Slice {
-		for i := 0; i < attrValsField.Len(); i++ {
-			vals = append(vals, attrValsField.Index(i).String())
+	if valsField.IsValid() && valsField.Kind() == reflect.Slice {
+		for i := 0; i < valsField.Len(); i++ {
+			vals = append(vals, valsField.Index(i).String())
 		}
 	}
 
-	return attrType, vals
+	return typeField.String(), vals
 }
 
 // Add creates a new LDAP entry (user) in Zitadel
-func (z *zitadelHandler) Add(boundDN string, req ldap.AddRequest, conn net.Conn) (ldap.LDAPResultCode, error) {
+func (z *zitadelHandler) Add(boundDN string, req ldap.AddRequest, conn net.Conn) (code ldap.LDAPResultCode, err error) {
+	defer z.recoverOp("Add", &code, &err)
+
 	// Extract DN and attributes
 	dn, attrs, err := z.extractAddRequestFields(req)
 	if err != nil {
@@ -133,20 +142,12 @@ func (z *zitadelHandler) Add(boundDN string, req ldap.AddRequest, conn net.Conn)
 		return ldap.LDAPResultInvalidDNSyntax, fmt.Errorf("DN is required")
 	}
 
+	username, code, err := z.authorizeWriteTarget(boundDN, dn)
+	if err != nil {
+		return code, err
+	}
+
 	z.log.Info().Str("dn", dn).Msg("Adding user")
-
-	// Parse DN to extract username
-	parsedDN, err := ldaputil.ParseAndValidateDN(dn)
-	if err != nil {
-		z.log.Warn().Err(err).Str("dn", dn).Msg("Invalid DN syntax")
-		return ldap.LDAPResultInvalidDNSyntax, fmt.Errorf("invalid DN: %s", dn)
-	}
-
-	username, err := ldaputil.ExtractCNFromDN(parsedDN)
-	if err != nil {
-		z.log.Warn().Err(err).Str("dn", dn).Msg("Invalid CN in DN")
-		return ldap.LDAPResultInvalidDNSyntax, fmt.Errorf("invalid CN in DN: %s", dn)
-	}
 
 	// Build create request
 	createReq := &zclient.UserCreateRequest{
@@ -186,27 +187,21 @@ func (z *zitadelHandler) Add(boundDN string, req ldap.AddRequest, conn net.Conn)
 }
 
 // Modify updates an existing LDAP entry (user) in Zitadel
-func (z *zitadelHandler) Modify(boundDN string, req ldap.ModifyRequest, conn net.Conn) (ldap.LDAPResultCode, error) {
+func (z *zitadelHandler) Modify(boundDN string, req ldap.ModifyRequest, conn net.Conn) (code ldap.LDAPResultCode, err error) {
+	defer z.recoverOp("Modify", &code, &err)
+
 	dn := req.Dn
 	if dn == "" {
 		z.log.Warn().Msg("Empty DN in Modify request")
 		return ldap.LDAPResultInvalidDNSyntax, fmt.Errorf("DN is required")
 	}
 
+	username, code, err := z.authorizeWriteTarget(boundDN, dn)
+	if err != nil {
+		return code, err
+	}
+
 	z.log.Info().Str("dn", dn).Msg("Modifying user")
-
-	// Parse DN to extract username
-	parsedDN, err := ldaputil.ParseAndValidateDN(dn)
-	if err != nil {
-		z.log.Warn().Err(err).Str("dn", dn).Msg("Invalid DN syntax")
-		return ldap.LDAPResultInvalidDNSyntax, fmt.Errorf("invalid DN: %s", dn)
-	}
-
-	username, err := ldaputil.ExtractCNFromDN(parsedDN)
-	if err != nil {
-		z.log.Warn().Err(err).Str("dn", dn).Msg("Invalid CN in DN")
-		return ldap.LDAPResultInvalidDNSyntax, fmt.Errorf("invalid CN in DN: %s", dn)
-	}
 
 	// Create context with timeout
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
@@ -250,26 +245,20 @@ func (z *zitadelHandler) Modify(boundDN string, req ldap.ModifyRequest, conn net
 }
 
 // Delete removes an existing LDAP entry (user) from Zitadel
-func (z *zitadelHandler) Delete(boundDN, deleteDN string, conn net.Conn) (ldap.LDAPResultCode, error) {
+func (z *zitadelHandler) Delete(boundDN, deleteDN string, conn net.Conn) (code ldap.LDAPResultCode, err error) {
+	defer z.recoverOp("Delete", &code, &err)
+
 	if deleteDN == "" {
 		z.log.Warn().Msg("Empty DN in Delete request")
 		return ldap.LDAPResultInvalidDNSyntax, fmt.Errorf("DN is required")
 	}
 
+	username, code, err := z.authorizeWriteTarget(boundDN, deleteDN)
+	if err != nil {
+		return code, err
+	}
+
 	z.log.Info().Str("dn", deleteDN).Msg("Deleting user")
-
-	// Parse DN to extract username
-	parsedDN, err := ldaputil.ParseAndValidateDN(deleteDN)
-	if err != nil {
-		z.log.Warn().Err(err).Str("dn", deleteDN).Msg("Invalid DN syntax")
-		return ldap.LDAPResultInvalidDNSyntax, fmt.Errorf("invalid DN: %s", deleteDN)
-	}
-
-	username, err := ldaputil.ExtractCNFromDN(parsedDN)
-	if err != nil {
-		z.log.Warn().Err(err).Str("dn", deleteDN).Msg("Invalid CN in DN")
-		return ldap.LDAPResultInvalidDNSyntax, fmt.Errorf("invalid CN in DN: %s", deleteDN)
-	}
 
 	// Create context with timeout
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
@@ -297,4 +286,23 @@ func (z *zitadelHandler) Delete(boundDN, deleteDN string, conn net.Conn) (ldap.L
 
 	z.log.Info().Str("username", username).Str("userID", user.UserID).Msg("User deleted successfully")
 	return ldap.LDAPResultSuccess, nil
+}
+
+// authorizeWriteTarget checks that boundDN may write and that targetDN is a
+// user entry directly under ou=users,<baseDN>. It returns the user name.
+func (z *zitadelHandler) authorizeWriteTarget(boundDN, targetDN string) (string, ldap.LDAPResultCode, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
+	defer cancel()
+
+	if code, err := z.authorizeWrite(ctx, boundDN); err != nil {
+		return "", code, err
+	}
+
+	username, err := z.usernameFromDN(targetDN)
+	if err != nil {
+		z.log.Warn().Err(err).Str("dn", targetDN).Msg("Rejected write target DN")
+		return "", ldap.LDAPResultInvalidDNSyntax, fmt.Errorf("invalid DN: %s", targetDN)
+	}
+
+	return username, ldap.LDAPResultSuccess, nil
 }

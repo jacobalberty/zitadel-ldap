@@ -28,6 +28,8 @@ func (f *fakeCacher[K, V]) GetMany(ctx context.Context, keys []K, loaderFunc cac
 	return map[K]V{}, nil
 }
 
+func (f *fakeCacher[K, V]) Clear() {}
+
 func TestListUsersUsesCacheKey(t *testing.T) {
 	users := &zclient.UserResults{Result: []zclient.User{{UserID: "u1", Username: "alice", Human: &zclient.Human{}}}}
 	usersCache := &fakeCacher[CacheKey, *zclient.UserResults]{value: users}

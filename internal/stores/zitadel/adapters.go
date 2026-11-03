@@ -36,8 +36,8 @@ func convertSDKUserToUser(zuser *userv2.User) zclient.User {
 				Email:      humanUser.Email.Email,
 				IsVerified: humanUser.Email.IsVerified,
 			},
-			PasswordChanged: time.Now(),
-			Groups:          []string{},
+			// PasswordChanged is not provided by the list API; leave it zero rather than fabricating a value.
+			Groups: []string{},
 		}
 	}
 
@@ -186,7 +186,7 @@ func humanUserAdapter(humanUser *userv2.HumanUser) *zclient.Human {
 			Email:      humanUser.Email.Email,
 			IsVerified: humanUser.Email.IsVerified,
 		},
-		PasswordChanged: time.Now(),
-		Groups:          []string{},
+		// PasswordChanged is not provided by the list API; leave it zero rather than fabricating a value.
+		Groups: []string{},
 	}
 }

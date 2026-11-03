@@ -6,14 +6,16 @@ import (
 	"strings"
 
 	"github.com/zitadel/zitadel-go/v3/pkg/client/zitadel/management"
+	"github.com/zitadel/zitadel-go/v3/pkg/client/zitadel/metadata"
 	"github.com/zitadel/zitadel-go/v3/pkg/client/zitadel/object"
 	objectv2 "github.com/zitadel/zitadel-go/v3/pkg/client/zitadel/object/v2"
+	"github.com/zitadel/zitadel-go/v3/pkg/client/zitadel/project"
+	"github.com/zitadel/zitadel-go/v3/pkg/client/zitadel/user"
 	userv2 "github.com/zitadel/zitadel-go/v3/pkg/client/zitadel/user/v2"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
 	apperrors "github.com/jacobalberty/zitadel-ldap/internal/errors"
-	"github.com/jacobalberty/zitadel-ldap/internal/retry"
 	zclient "github.com/jacobalberty/zitadel-ldap/internal/zitadel"
 	"google.golang.org/grpc"
 )
@@ -133,43 +135,22 @@ func (q *querier) fetchAllUsers(ctx context.Context) (*zclient.UserResults, erro
 }
 
 func fetchAllUsersWithService(ctx context.Context, userService userLister, listGrants func(context.Context) (*zclient.GrantResults, error)) (*zclient.UserResults, error) {
-	var allUsers []zclient.User
-	var offset uint64 = 0
-	const limit uint32 = 100
-
-	retryConfig := retry.DefaultConfig()
-
-	for {
-		req := &userv2.ListUsersRequest{
-			Query: &objectv2.ListQuery{
-				Offset: offset,
-				Limit:  limit,
-				Asc:    true,
-			},
-		}
-
-		resp, err := retry.Do(ctx, retryConfig, func() (*userv2.ListUsersResponse, error) {
-			resp, err := userService.ListUsers(ctx, req)
+	allUsers, err := paginate(ctx, "ListUsers", "users",
+		func(ctx context.Context, offset uint64, limit uint32) (rawPage[*userv2.User], error) {
+			resp, err := userService.ListUsers(ctx, &userv2.ListUsersRequest{
+				Query: &objectv2.ListQuery{Offset: offset, Limit: limit, Asc: true},
+			})
 			if err != nil {
-				return nil, classifyError("ListUsers", err)
+				return rawPage[*userv2.User]{}, err
 			}
-			return resp, nil
-		})
-
-		if err != nil {
-			return nil, fmt.Errorf("failed to list users at offset %d: %w", offset, err)
-		}
-
-		for _, sdkUser := range resp.Result {
-			u := convertSDKUserToUser(sdkUser)
-			allUsers = append(allUsers, u)
-		}
-
-		if resp.Details == nil || offset+uint64(len(resp.Result)) >= resp.Details.TotalResult {
-			break
-		}
-
-		offset += uint64(limit)
+			p := rawPage[*userv2.User]{items: resp.Result}
+			if resp.Details != nil {
+				p.total, p.hasTotal = resp.Details.TotalResult, true
+			}
+			return p, nil
+		}, convertSDKUserToUser)
+	if err != nil {
+		return nil, err
 	}
 
 	grants, err := listGrants(ctx)
@@ -202,43 +183,22 @@ func (q *querier) fetchAllGrants(ctx context.Context) (*zclient.GrantResults, er
 }
 
 func fetchAllGrantsWithService(ctx context.Context, mgmtService grantLister) (*zclient.GrantResults, error) {
-	var allGrants []zclient.Grant
-	var offset uint64 = 0
-	const limit uint32 = 100
-
-	retryConfig := retry.DefaultConfig()
-
-	for {
-		req := &management.ListUserGrantRequest{
-			Query: &object.ListQuery{
-				Offset: offset,
-				Limit:  limit,
-				Asc:    true,
-			},
-		}
-
-		resp, err := retry.Do(ctx, retryConfig, func() (*management.ListUserGrantResponse, error) {
-			resp, err := mgmtService.ListUserGrants(ctx, req)
+	allGrants, err := paginate(ctx, "ListUserGrants", "grants",
+		func(ctx context.Context, offset uint64, limit uint32) (rawPage[*user.UserGrant], error) {
+			resp, err := mgmtService.ListUserGrants(ctx, &management.ListUserGrantRequest{
+				Query: &object.ListQuery{Offset: offset, Limit: limit, Asc: true},
+			})
 			if err != nil {
-				return nil, classifyError("ListUserGrants", err)
+				return rawPage[*user.UserGrant]{}, err
 			}
-			return resp, nil
-		})
-
-		if err != nil {
-			return nil, fmt.Errorf("failed to list grants at offset %d: %w", offset, err)
-		}
-
-		for _, sdkGrant := range resp.Result {
-			g := convertSDKGrantToGrant(sdkGrant)
-			allGrants = append(allGrants, g)
-		}
-
-		if resp.Details == nil || offset+uint64(len(resp.Result)) >= resp.Details.TotalResult {
-			break
-		}
-
-		offset += uint64(limit)
+			p := rawPage[*user.UserGrant]{items: resp.Result}
+			if resp.Details != nil {
+				p.total, p.hasTotal = resp.Details.TotalResult, true
+			}
+			return p, nil
+		}, convertSDKGrantToGrant)
+	if err != nil {
+		return nil, err
 	}
 
 	return &zclient.GrantResults{
@@ -255,49 +215,28 @@ func (q *querier) fetchAllProjects(ctx context.Context) (*zclient.ProjectResults
 }
 
 func fetchAllProjectsWithService(ctx context.Context, mgmtService projectLister) (*zclient.ProjectResults, error) {
-	var allProjects []zclient.ProjectResult
-	var offset uint64 = 0
-	const limit uint32 = 100
-
-	retryConfig := retry.DefaultConfig()
-
-	for {
-		req := &management.ListProjectsRequest{
-			Query: &object.ListQuery{
-				Offset: offset,
-				Limit:  limit,
-				Asc:    true,
-			},
-		}
-
-		resp, err := retry.Do(ctx, retryConfig, func() (*management.ListProjectsResponse, error) {
-			resp, err := mgmtService.ListProjects(ctx, req)
+	all, err := paginate(ctx, "ListProjects", "projects",
+		func(ctx context.Context, offset uint64, limit uint32) (rawPage[*project.Project], error) {
+			resp, err := mgmtService.ListProjects(ctx, &management.ListProjectsRequest{
+				Query: &object.ListQuery{Offset: offset, Limit: limit, Asc: true},
+			})
 			if err != nil {
-				return nil, classifyError("ListProjects", err)
+				return rawPage[*project.Project]{}, err
 			}
-			return resp, nil
-		})
-
-		if err != nil {
-			return nil, fmt.Errorf("failed to list projects at offset %d: %w", offset, err)
-		}
-
-		for _, sdkProject := range resp.Result {
-			p := convertSDKProjectToProjectResult(sdkProject)
-			allProjects = append(allProjects, p)
-		}
-
-		if resp.Details == nil || offset+uint64(len(resp.Result)) >= resp.Details.TotalResult {
-			break
-		}
-
-		offset += uint64(limit)
+			p := rawPage[*project.Project]{items: resp.Result}
+			if resp.Details != nil {
+				p.total, p.hasTotal = resp.Details.TotalResult, true
+			}
+			return p, nil
+		}, convertSDKProjectToProjectResult)
+	if err != nil {
+		return nil, err
 	}
 
 	return &zclient.ProjectResults{
-		Result: allProjects,
+		Result: all,
 		Details: zclient.Details{
-			TotalResult: fmt.Sprintf("%d", len(allProjects)),
+			TotalResult: fmt.Sprintf("%d", len(all)),
 		},
 	}, nil
 }
@@ -308,50 +247,29 @@ func (q *querier) fetchRoles(ctx context.Context, projectID string) (*zclient.Ro
 }
 
 func fetchRolesWithService(ctx context.Context, mgmtService roleLister, projectID string) (*zclient.RoleResults, error) {
-	var allRoles []zclient.RoleResult
-	var offset uint64 = 0
-	const limit uint32 = 100
-
-	retryConfig := retry.DefaultConfig()
-
-	for {
-		req := &management.ListProjectRolesRequest{
-			ProjectId: projectID,
-			Query: &object.ListQuery{
-				Offset: offset,
-				Limit:  limit,
-				Asc:    true,
-			},
-		}
-
-		resp, err := retry.Do(ctx, retryConfig, func() (*management.ListProjectRolesResponse, error) {
-			resp, err := mgmtService.ListProjectRoles(ctx, req)
+	all, err := paginate(ctx, "ListProjectRoles", "roles for project "+projectID,
+		func(ctx context.Context, offset uint64, limit uint32) (rawPage[*project.Role], error) {
+			resp, err := mgmtService.ListProjectRoles(ctx, &management.ListProjectRolesRequest{
+				ProjectId: projectID,
+				Query:     &object.ListQuery{Offset: offset, Limit: limit, Asc: true},
+			})
 			if err != nil {
-				return nil, classifyError("ListProjectRoles", err)
+				return rawPage[*project.Role]{}, err
 			}
-			return resp, nil
-		})
-
-		if err != nil {
-			return nil, fmt.Errorf("failed to list roles for project %s at offset %d: %w", projectID, offset, err)
-		}
-
-		for _, sdkRole := range resp.Result {
-			r := convertSDKRoleToRoleResult(sdkRole)
-			allRoles = append(allRoles, r)
-		}
-
-		if resp.Details == nil || offset+uint64(len(resp.Result)) >= resp.Details.TotalResult {
-			break
-		}
-
-		offset += uint64(limit)
+			p := rawPage[*project.Role]{items: resp.Result}
+			if resp.Details != nil {
+				p.total, p.hasTotal = resp.Details.TotalResult, true
+			}
+			return p, nil
+		}, convertSDKRoleToRoleResult)
+	if err != nil {
+		return nil, err
 	}
 
 	return &zclient.RoleResults{
-		Result: allRoles,
+		Result: all,
 		Details: zclient.Details{
-			TotalResult: fmt.Sprintf("%d", len(allRoles)),
+			TotalResult: fmt.Sprintf("%d", len(all)),
 		},
 	}, nil
 }
@@ -362,50 +280,29 @@ func (q *querier) fetchMetadata(ctx context.Context, userID string) (*zclient.Me
 }
 
 func fetchMetadataWithService(ctx context.Context, mgmtService metadataLister, userID string) (*zclient.MetadataResults, error) {
-	var allMetadata []zclient.MetadataResult
-	var offset uint64 = 0
-	const limit uint32 = 100
-
-	retryConfig := retry.DefaultConfig()
-
-	for {
-		req := &management.ListUserMetadataRequest{
-			Id: userID,
-			Query: &object.ListQuery{
-				Offset: offset,
-				Limit:  limit,
-				Asc:    true,
-			},
-		}
-
-		resp, err := retry.Do(ctx, retryConfig, func() (*management.ListUserMetadataResponse, error) {
-			resp, err := mgmtService.ListUserMetadata(ctx, req)
+	all, err := paginate(ctx, "ListUserMetadata", "metadata for user "+userID,
+		func(ctx context.Context, offset uint64, limit uint32) (rawPage[*metadata.Metadata], error) {
+			resp, err := mgmtService.ListUserMetadata(ctx, &management.ListUserMetadataRequest{
+				Id:    userID,
+				Query: &object.ListQuery{Offset: offset, Limit: limit, Asc: true},
+			})
 			if err != nil {
-				return nil, classifyError("ListUserMetadata", err)
+				return rawPage[*metadata.Metadata]{}, err
 			}
-			return resp, nil
-		})
-
-		if err != nil {
-			return nil, fmt.Errorf("failed to list metadata for user %s at offset %d: %w", userID, offset, err)
-		}
-
-		for _, sdkMetadata := range resp.Result {
-			m := convertSDKMetadataToMetadataResult(sdkMetadata)
-			allMetadata = append(allMetadata, m)
-		}
-
-		if resp.Details == nil || offset+uint64(len(resp.Result)) >= resp.Details.TotalResult {
-			break
-		}
-
-		offset += uint64(limit)
+			p := rawPage[*metadata.Metadata]{items: resp.Result}
+			if resp.Details != nil {
+				p.total, p.hasTotal = resp.Details.TotalResult, true
+			}
+			return p, nil
+		}, convertSDKMetadataToMetadataResult)
+	if err != nil {
+		return nil, err
 	}
 
 	return &zclient.MetadataResults{
-		Result: allMetadata,
+		Result: all,
 		Details: zclient.Details{
-			TotalResult: fmt.Sprintf("%d", len(allMetadata)),
+			TotalResult: fmt.Sprintf("%d", len(all)),
 		},
 	}, nil
 }
@@ -437,6 +334,15 @@ func classifyError(operation string, err error) error {
 	case codes.NotFound:
 		wrappedErr = fmt.Errorf("%w: %s", apperrors.ErrNotFound, st.Message())
 		retryable = false
+
+	case codes.AlreadyExists:
+		wrappedErr = fmt.Errorf("%w: %s", apperrors.ErrAlreadyExists, st.Message())
+		retryable = false
+
+	case codes.Aborted:
+		// Concurrent-modification conflicts are transient.
+		wrappedErr = fmt.Errorf("%w: %s", apperrors.ErrServiceUnavailable, st.Message())
+		retryable = true
 
 	case codes.Unauthenticated:
 		wrappedErr = fmt.Errorf("%w: %s", apperrors.ErrUnauthorized, st.Message())

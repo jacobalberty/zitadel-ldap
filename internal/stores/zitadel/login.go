@@ -119,8 +119,15 @@ func classifyLoginError(err error) error {
 	// Use the same classification logic as other operations
 	classified := classifyError("CreateSession", err)
 
-	// For login, treat authentication errors specially
-	if apperrors.IsUnauthorized(classified) {
+	// For login, treat authentication errors specially. Zitadel reports a bad
+	// password, an unknown user or a locked account with different gRPC codes
+	// depending on version/configuration; none of them is an operational error
+	// and all must reach the client as "invalid credentials" (not as an
+	// OperationsError, and without revealing which case applied).
+	if apperrors.IsUnauthorized(classified) ||
+		apperrors.IsNotFound(classified) ||
+		apperrors.IsForbidden(classified) ||
+		errors.Is(classified, apperrors.ErrInvalidInput) {
 		// Invalid credentials shouldn't be retried
 		return apperrors.NewZitadelError("CreateSession", apperrors.ErrUnauthorized, false)
 	}

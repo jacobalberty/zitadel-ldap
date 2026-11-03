@@ -12,12 +12,14 @@ import (
 	"runtime/debug"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/GeertJohan/yubigo"
 	"github.com/glauth/glauth/v2/pkg/config"
 	"github.com/glauth/glauth/v2/pkg/handler"
 	"github.com/glauth/ldap"
+	goldap "github.com/go-ldap/ldap/v3"
 	"github.com/rs/zerolog"
 	"github.com/zitadel/zitadel-go/v3/pkg/client"
 	zit "github.com/zitadel/zitadel-go/v3/pkg/zitadel"
@@ -30,12 +32,28 @@ import (
 	zclient "github.com/jacobalberty/zitadel-ldap/internal/zitadel"
 )
 
+// splitDN splits a DN on unescaped commas (RFC 4514: "\," is a literal comma).
+func splitDN(dn string) []string {
+	var parts []string
+	start := 0
+	for i := 0; i < len(dn); i++ {
+		switch dn[i] {
+		case '\\':
+			i++ // skip the escaped character
+		case ',':
+			parts = append(parts, dn[start:i])
+			start = i + 1
+		}
+	}
+	return append(parts, dn[start:])
+}
+
 func upperDNAttributeTypes(dn string) string {
 	if dn == "" {
 		return dn
 	}
 
-	parts := strings.Split(dn, ",")
+	parts := splitDN(dn)
 	for i, part := range parts {
 		p := strings.TrimSpace(part)
 		kv := strings.SplitN(p, "=", 2)
@@ -50,6 +68,20 @@ func upperDNAttributeTypes(dn string) string {
 	return strings.Join(parts, ",")
 }
 
+// buildDN assembles "<attr>=<escaped value>[,<hierarchy>],<baseDN>". The value
+// is escaped so user/group names containing commas, '+', quotes etc. cannot
+// inject extra RDNs or break the DN.
+func (z *zitadelHandler) buildDN(attr, value, hierarchy string) string {
+	dn := attr + "=" + goldap.EscapeDN(value)
+	if hierarchy != "" {
+		dn += "," + hierarchy
+	}
+	if z.baseDN != "" {
+		dn += "," + z.baseDN
+	}
+	return dn
+}
+
 const (
 	// defaultTimeout is the default timeout for Zitadel API calls
 	defaultTimeout = 30 * time.Second
@@ -62,6 +94,9 @@ type zitadelHandler struct {
 	log         *zerolog.Logger
 	yubikeyAuth *yubigo.YubiAuth
 	baseDN      string
+
+	dynOnce sync.Once
+	dynDefs []dynamicGroupDefinition
 
 	// writesEnabled gates Add/Modify/Delete (ZITADEL_LDAP_ENABLE_WRITES).
 	writesEnabled bool
@@ -281,16 +316,17 @@ func (z *zitadelHandler) FindUser(ctx context.Context, userName string, searchBy
 	z.log.Debug().Str("user", zUser.Username).Int("metadata", len(metadata.Result)).Msg("Found metadata")
 
 	for _, m := range metadata.Result {
-		z.log.Debug().Str("user", zUser.Username).Str("metadata key", m.Key).Str("value", string(m.Value)).Msg("Checking metadata key")
+		z.log.Debug().Str("user", zUser.Username).Str("metadata key", m.Key).Msg("Checking metadata key")
 		if strings.HasPrefix(m.Key, "cap_") {
 			z.log.Debug().Str("user", zUser.Username).Str("metadata key", m.Key).Msg("Valid cap key")
 			key := strings.TrimPrefix(m.Key, "cap_")
 			val, err := base64.StdEncoding.DecodeString(string(m.Value))
 			if err != nil {
-				return false, config.User{}, err
+				z.log.Warn().Str("user", zUser.Username).Str("key", m.Key).Msg("Skipping capability with invalid base64 value")
+				continue
 			}
 
-			z.log.Debug().Str("user", zUser.Username).Str("metadata key", m.Key).Str("value", string(val)).Msg("Appending to existing caps")
+			z.log.Debug().Str("user", zUser.Username).Str("metadata key", m.Key).Msg("Appending to existing caps")
 
 			caps = append(caps, config.Capability{
 				Action: key,
@@ -413,7 +449,8 @@ func (z *zitadelHandler) FindPosixAccounts(ctx context.Context, hierarchy string
 			return nil, fmt.Errorf("failed to get memberOf for user %s: %w", u.UserID, err)
 		}
 
-		attrs = append(attrs, &ldap.EntryAttribute{Name: "memberOf", Values: groups})
+		memberAttr := &ldap.EntryAttribute{Name: "memberOf", Values: groups}
+		attrs = append(attrs, memberAttr)
 
 		attrs = append(attrs, &ldap.EntryAttribute{Name: "shadowExpire", Values: []string{"-1"}})
 		attrs = append(attrs, &ldap.EntryAttribute{Name: "shadowFlag", Values: []string{"134538308"}})
@@ -433,13 +470,20 @@ func (z *zitadelHandler) FindPosixAccounts(ctx context.Context, hierarchy string
 				key := strings.TrimPrefix(m.Key, "gl_")
 				val, err := base64.StdEncoding.DecodeString(string(m.Value))
 				if err != nil {
-					return nil, err
+					z.log.Warn().Str("user", u.Username).Str("key", m.Key).Msg("Skipping metadata with invalid base64 value")
+					continue
 				}
 				attrs = append(attrs, &ldap.EntryAttribute{Name: key, Values: []string{string(val)}})
 			}
 		}
 
-		dn := upperDNAttributeTypes(fmt.Sprintf("%s=%s,%s,%s", z.options.Backend.NameFormat, u.Username, hierarchy, z.baseDN))
+		dynGroups, err := z.dynamicMemberOf(u, metadata)
+		if err != nil {
+			return nil, fmt.Errorf("failed to evaluate dynamic groups for user %s: %w", u.UserID, err)
+		}
+		memberAttr.Values = append(memberAttr.Values, dynGroups...)
+
+		dn := upperDNAttributeTypes(z.buildDN(z.options.Backend.NameFormat, u.Username, hierarchy))
 
 		entries = append(entries, &ldap.Entry{DN: dn, Attributes: nonEmptyAttrs(attrs)})
 	}
@@ -501,11 +545,14 @@ func (z *zitadelHandler) FindPosixGroups(ctx context.Context, hierarchy string) 
 		return nil, fmt.Errorf("failed to list grants: %w", err)
 	}
 
+	// Grants reference roles by Key, so members are indexed by (project, role key).
+	// A NUL delimiter keeps ("ab","c") and ("a","bc") distinct.
 	grantMap := map[string][]string{}
 
 	for _, g := range grants.Result {
-		for _, r := range g.RoleKeys {
-			grantMap[g.ProjectName+r] = append(grantMap[g.ProjectName+r], z.addUserHierarchy(g.UserName, "ou=users"))
+		for _, rk := range g.RoleKeys {
+			k := g.ProjectName + "\x00" + rk
+			grantMap[k] = append(grantMap[k], z.addUserHierarchy(g.UserName, "ou=users"))
 		}
 	}
 
@@ -519,34 +566,97 @@ func (z *zitadelHandler) FindPosixGroups(ctx context.Context, hierarchy string) 
 
 		for _, r := range roles.Result {
 
+			// The GID hash input is intentionally unchanged to keep emitted numbers stable.
 			groupKey := p.Name + r.Group
+			members := grantMap[p.Name+"\x00"+r.Key]
 
 			attrs := []*ldap.EntryAttribute{}
 			attrs = append(attrs, &ldap.EntryAttribute{Name: "CN", Values: []string{r.Group}})
 			attrs = append(attrs, &ldap.EntryAttribute{Name: "description", Values: []string{fmt.Sprintf("%s via Zitadel", r.Group)}})
 			attrs = append(attrs, &ldap.EntryAttribute{Name: "gidNumber", Values: []string{fmt.Sprintf("%d", z.hash(groupKey))}})
-			attrs = append(attrs, &ldap.EntryAttribute{Name: "uniqueMember", Values: grantMap[groupKey]})
+			attrs = append(attrs, &ldap.EntryAttribute{Name: "uniqueMember", Values: members})
 
 			if asGroupOfUniqueNames {
 				attrs = append(attrs, &ldap.EntryAttribute{Name: "objectClass", Values: []string{"groupOfUniqueNames", "top"}})
 			} else {
-				attrs = append(attrs, &ldap.EntryAttribute{Name: "memberUid", Values: grantMap[groupKey]})
+				attrs = append(attrs, &ldap.EntryAttribute{Name: "memberUid", Values: members})
 				attrs = append(attrs, &ldap.EntryAttribute{Name: "objectClass", Values: []string{"posixGroup", "top"}})
 			}
 
-			dn := fmt.Sprintf("%s=%s,%s", z.options.Backend.GroupFormat, r.Group, z.baseDN)
-			if hierarchy != "" {
-				dn = fmt.Sprintf("%s=%s,%s,%s", z.options.Backend.GroupFormat, r.Group, hierarchy, z.baseDN)
-			}
-			dn = upperDNAttributeTypes(dn)
+			dn := upperDNAttributeTypes(z.buildDN(z.options.Backend.GroupFormat, r.Group, hierarchy))
 
 			entries = append(entries, &ldap.Entry{DN: dn, Attributes: nonEmptyAttrs(attrs)})
 		}
 
 	}
 
+	dynEntries, err := z.dynamicGroupEntries(ctx, hierarchy, asGroupOfUniqueNames, entries)
+	if err != nil {
+		return nil, err
+	}
+	entries = append(entries, dynEntries...)
+
 	return entries, nil
 
+}
+
+// dynamicGroupEntries builds LDAP entries for filter-based groups defined in
+// the glauth config. It is a no-op when no dynamic groups are configured.
+func (z *zitadelHandler) dynamicGroupEntries(ctx context.Context, hierarchy string, asGroupOfUniqueNames bool, existing []*ldap.Entry) ([]*ldap.Entry, error) {
+	defs := z.dynamicGroupDefinitions()
+	if len(defs) == 0 {
+		return nil, nil
+	}
+
+	users, err := z.repository.ListUsers(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list users for dynamic groups: %w", err)
+	}
+	md := make(map[string]*zclient.MetadataResults, len(users.Result))
+	for _, u := range users.Result {
+		if u.Human == nil {
+			continue
+		}
+		m, err := z.repository.ListMetadata(ctx, u.UserID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to list metadata for user %s: %w", u.UserID, err)
+		}
+		md[u.UserID] = m
+	}
+
+	members, err := z.resolveDynamicGroupMembers(users.Result, md, "ou=users", defs)
+	if err != nil {
+		return nil, err
+	}
+
+	taken := map[string]bool{}
+	for _, e := range existing {
+		taken[strings.ToLower(e.DN)] = true
+	}
+
+	var out []*ldap.Entry
+	for _, def := range defs {
+		dn := upperDNAttributeTypes(z.buildDN(z.options.Backend.GroupFormat, def.name, hierarchy))
+		if taken[strings.ToLower(dn)] {
+			z.log.Warn().Str("group", def.name).Msg("Dynamic group name collides with an existing group; skipping")
+			continue
+		}
+		attrs := []*ldap.EntryAttribute{
+			{Name: "CN", Values: []string{def.name}},
+			{Name: "description", Values: []string{fmt.Sprintf("%s (dynamic)", def.name)}},
+			{Name: "gidNumber", Values: []string{fmt.Sprintf("%d", def.gidNumber)}},
+			{Name: "uniqueMember", Values: members[def.name]},
+		}
+		if asGroupOfUniqueNames {
+			attrs = append(attrs, &ldap.EntryAttribute{Name: "objectClass", Values: []string{"groupOfUniqueNames", "top"}})
+		} else {
+			attrs = append(attrs, &ldap.EntryAttribute{Name: "memberUid", Values: members[def.name]})
+			attrs = append(attrs, &ldap.EntryAttribute{Name: "objectClass", Values: []string{"posixGroup", "top"}})
+		}
+		out = append(out, &ldap.Entry{DN: dn, Attributes: nonEmptyAttrs(attrs)})
+	}
+
+	return out, nil
 }
 
 func (z *zitadelHandler) hash(s string) int {
@@ -556,10 +666,10 @@ func (z *zitadelHandler) hash(s string) int {
 }
 
 func (z *zitadelHandler) addUserHierarchy(user string, hierarchy string) string {
-	if hierarchy != "" {
-		return upperDNAttributeTypes(fmt.Sprintf("%s=%s,%s,%s", z.options.Backend.NameFormat, user, hierarchy, z.baseDN))
+	if hierarchy == "" {
+		hierarchy = "OU=users"
 	}
-	return upperDNAttributeTypes(fmt.Sprintf("%s=%s,OU=users,%s", z.options.Backend.NameFormat, user, z.baseDN))
+	return upperDNAttributeTypes(z.buildDN(z.options.Backend.NameFormat, user, hierarchy))
 }
 
 func (z *zitadelHandler) memberOf(ctx context.Context, userID string) ([]string, error) {
@@ -569,13 +679,30 @@ func (z *zitadelHandler) memberOf(ctx context.Context, userID string) ([]string,
 	}
 
 	groups := []string{}
+	roleGroups := map[string]map[string]string{} // projectID -> role key -> group
 
 	for _, g := range grants.Result {
-		if g.UserID == userID {
-			for _, rk := range g.RoleKeys {
-				key := fmt.Sprintf("%s=%s,ou=groups,%s", z.options.Backend.GroupFormat, rk, z.baseDN)
-				groups = append(groups, key)
+		if g.UserID != userID {
+			continue
+		}
+		for _, rk := range g.RoleKeys {
+			name := rk
+			// Group entries are named after the role's Group, not its Key.
+			if _, ok := roleGroups[g.ProjectID]; !ok {
+				m := map[string]string{}
+				if roles, err := z.repository.ListRoles(ctx, g.ProjectID); err == nil && roles != nil {
+					for _, r := range roles.Result {
+						if r.Group != "" {
+							m[r.Key] = r.Group
+						}
+					}
+				}
+				roleGroups[g.ProjectID] = m
 			}
+			if gn, ok := roleGroups[g.ProjectID][rk]; ok {
+				name = gn
+			}
+			groups = append(groups, z.buildDN(z.options.Backend.GroupFormat, name, "ou=groups"))
 		}
 	}
 

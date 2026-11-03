@@ -174,8 +174,8 @@ func (z *zitadelHandler) userAttributesForFilter(u zclient.User, metadata *zclie
 
 		key := strings.ToLower(m.Key)
 		attrs[key] = append(attrs[key], string(value))
-		if strings.HasPrefix(key, "gl_") {
-			trimmed := strings.TrimPrefix(key, "gl_")
+		if after, ok := strings.CutPrefix(key, "gl_"); ok {
+			trimmed := after
 			if trimmed != "" {
 				attrs[trimmed] = append(attrs[trimmed], string(value))
 			}

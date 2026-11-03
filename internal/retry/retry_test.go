@@ -149,7 +149,7 @@ func TestDoDeadlinePreservesErrTimeout(t *testing.T) {
 }
 
 func TestJitterWithinBounds(t *testing.T) {
-	for i := 0; i < 1000; i++ {
+	for range 1000 {
 		d := jitter(100 * time.Millisecond)
 		if d < 50*time.Millisecond || d > 100*time.Millisecond {
 			t.Fatalf("jitter out of range: %v", d)

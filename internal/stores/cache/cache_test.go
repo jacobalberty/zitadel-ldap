@@ -58,10 +58,8 @@ func TestGetSingleFlight(t *testing.T) {
 	var calls int32
 	release := make(chan struct{})
 	var wg sync.WaitGroup
-	for i := 0; i < 50; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for range 50 {
+		wg.Go(func() {
 			v, err := c.Get(context.Background(), "k", func(ctx context.Context) (int, error) {
 				atomic.AddInt32(&calls, 1)
 				<-release
@@ -70,7 +68,7 @@ func TestGetSingleFlight(t *testing.T) {
 			if err != nil || v != 9 {
 				t.Errorf("v=%d err=%v", v, err)
 			}
-		}()
+		})
 	}
 	time.Sleep(50 * time.Millisecond)
 	close(release)
@@ -148,11 +146,11 @@ func TestLoaderErrorNotCached(t *testing.T) {
 func TestConcurrentGetAndClearRace(t *testing.T) {
 	c := NewCacher[int, int]()
 	var wg sync.WaitGroup
-	for g := 0; g < 8; g++ {
+	for g := range 8 {
 		wg.Add(1)
 		go func(g int) {
 			defer wg.Done()
-			for i := 0; i < 200; i++ {
+			for i := range 200 {
 				if g%4 == 0 {
 					c.Clear()
 					continue

@@ -2,7 +2,7 @@ package zitadel
 
 // GrantResults contains paginated grant query results
 type GrantResults struct {
-	Details Details `json:"details,omitempty"`
+	Details Details `json:"details"`
 	Result  []Grant `json:"result,omitempty"`
 }
 

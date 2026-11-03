@@ -41,6 +41,9 @@ To add a custom field called `test` to a user, set the metadata `gl_test` with a
 | `ZITADEL_LDAP_ENABLE_WRITES` | `false` | Enables LDAP Add/Modify/Delete. When off, every write returns `insufficientAccessRights`. |
 | `ZITADEL_LDAP_ALLOW_ANONYMOUS_BIND` | `true` | Set to `false` to reject anonymous binds. |
 | `ZITADEL_LDAP_LOGIN_CACHE_TTL` | `60s` | How long a *successful* bind is cached (Go duration; `0` disables). Failures are never cached. |
+| `ZITADEL_LDAP_CACHE_TTL` | `1h` | Lifetime of cached users/grants/projects/roles/metadata. Lower it for fresher data at the cost of more Zitadel calls. |
+| `ZITADEL_LDAP_METADATA_CACHE_SIZE` | `10000` | Max cached per-user metadata entries (keep above your user count to avoid one gRPC call per user per search). |
+| `ZITADEL_LDAP_ROLES_CACHE_SIZE` | `1000` | Max cached per-project role lists. |
 
 Writes also require the bound user to have the `cap_write` metadata (value `*`), and the target DN must be
 `cn=<user>,ou=users,<baseDN>`. Writes act with the service account's privileges, so grant `cap_write` sparingly.

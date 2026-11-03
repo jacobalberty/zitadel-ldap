@@ -2,6 +2,9 @@ package cache
 
 import (
 	"context"
+	"errors"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -36,67 +39,6 @@ func TestGetCachesValue(t *testing.T) {
 	}
 }
 
-func TestGetManyLoadsMissingKeys(t *testing.T) {
-	c := NewCacher[string, int]()
-	_, _ = c.Get(context.Background(), "k1", func(ctx context.Context) (int, error) {
-		return 1, nil
-	})
-
-	calls := 0
-	vals, err := c.GetMany(context.Background(), []string{"k1", "k2"}, func(ctx context.Context) (map[string]int, error) {
-		calls++
-		return map[string]int{"k2": 2}, nil
-	})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if vals["k1"] != 1 || vals["k2"] != 2 {
-		t.Fatalf("unexpected values: %#v", vals)
-	}
-	if calls != 1 {
-		t.Fatalf("expected loader called once, got %d", calls)
-	}
-}
-
-func TestGetManyAllCached(t *testing.T) {
-	c := NewCacher[string, int]()
-	_, _ = c.Get(context.Background(), "k1", func(ctx context.Context) (int, error) {
-		return 1, nil
-	})
-	_, _ = c.Get(context.Background(), "k2", func(ctx context.Context) (int, error) {
-		return 2, nil
-	})
-
-	calls := 0
-	vals, err := c.GetMany(context.Background(), []string{"k1", "k2"}, func(ctx context.Context) (map[string]int, error) {
-		calls++
-		return map[string]int{"k1": 10, "k2": 20}, nil
-	})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if vals["k1"] != 1 || vals["k2"] != 2 {
-		t.Fatalf("unexpected values: %#v", vals)
-	}
-	if calls != 0 {
-		t.Fatalf("expected loader not called, got %d", calls)
-	}
-}
-
-func TestGetManyLoaderError(t *testing.T) {
-	c := NewCacher[string, int]()
-	_, _ = c.Get(context.Background(), "k1", func(ctx context.Context) (int, error) {
-		return 1, nil
-	})
-
-	_, err := c.GetMany(context.Background(), []string{"k1", "k2"}, func(ctx context.Context) (map[string]int, error) {
-		return nil, context.DeadlineExceeded
-	})
-	if err == nil {
-		t.Fatalf("expected error")
-	}
-}
-
 func TestNewCacherOptions(t *testing.T) {
 	c := NewCacher(func(opts *options[string, int]) {
 		opts.Capacity = 10
@@ -109,4 +51,115 @@ func TestNewCacherOptions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
+}
+
+func TestGetSingleFlight(t *testing.T) {
+	c := NewCacher[string, int]()
+	var calls int32
+	release := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			v, err := c.Get(context.Background(), "k", func(ctx context.Context) (int, error) {
+				atomic.AddInt32(&calls, 1)
+				<-release
+				return 9, nil
+			})
+			if err != nil || v != 9 {
+				t.Errorf("v=%d err=%v", v, err)
+			}
+		}()
+	}
+	time.Sleep(50 * time.Millisecond)
+	close(release)
+	wg.Wait()
+	if n := atomic.LoadInt32(&calls); n != 1 {
+		t.Fatalf("loader called %d times, want 1", n)
+	}
+}
+
+func TestClearDuringLoadDoesNotRepopulateStale(t *testing.T) {
+	c := NewCacher[string, int]()
+	started := make(chan struct{})
+	release := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _ = c.Get(context.Background(), "k", func(ctx context.Context) (int, error) {
+			close(started)
+			<-release
+			return 1, nil // pre-write data
+		})
+	}()
+	<-started
+	c.Clear() // a write happens while the load is in flight
+	close(release)
+	<-done
+
+	v, err := c.Get(context.Background(), "k", func(ctx context.Context) (int, error) { return 2, nil })
+	if err != nil || v != 2 {
+		t.Fatalf("stale value served after Clear: v=%d err=%v", v, err)
+	}
+}
+
+func TestCancelledCallerDoesNotFailOthers(t *testing.T) {
+	c := NewCacher[string, int]()
+	release := make(chan struct{})
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	started := make(chan struct{})
+	go func() {
+		_, _ = c.Get(ctx1, "k", func(ctx context.Context) (int, error) {
+			close(started)
+			<-release
+			if ctx.Err() != nil {
+				return 0, ctx.Err()
+			}
+			return 5, nil
+		})
+	}()
+	<-started
+	cancel1()
+	res := make(chan int, 1)
+	go func() {
+		v, _ := c.Get(context.Background(), "k", func(ctx context.Context) (int, error) { return -1, nil })
+		res <- v
+	}()
+	time.Sleep(20 * time.Millisecond)
+	close(release)
+	if v := <-res; v != 5 {
+		t.Fatalf("second caller got %d, want 5", v)
+	}
+}
+
+func TestLoaderErrorNotCached(t *testing.T) {
+	c := NewCacher[string, int]()
+	_, err := c.Get(context.Background(), "k", func(ctx context.Context) (int, error) { return 0, errors.New("x") })
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	v, err := c.Get(context.Background(), "k", func(ctx context.Context) (int, error) { return 3, nil })
+	if err != nil || v != 3 {
+		t.Fatalf("v=%d err=%v", v, err)
+	}
+}
+
+func TestConcurrentGetAndClearRace(t *testing.T) {
+	c := NewCacher[int, int]()
+	var wg sync.WaitGroup
+	for g := 0; g < 8; g++ {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			for i := 0; i < 200; i++ {
+				if g%4 == 0 {
+					c.Clear()
+					continue
+				}
+				_, _ = c.Get(context.Background(), i%5, func(ctx context.Context) (int, error) { return i, nil })
+			}
+		}(g)
+	}
+	wg.Wait()
 }

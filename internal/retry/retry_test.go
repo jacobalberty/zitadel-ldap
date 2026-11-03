@@ -115,3 +115,44 @@ func TestRetryMaxAttemptsExhausted(t *testing.T) {
 		t.Fatalf("Expected 3 attempts, got %d", attempts)
 	}
 }
+
+func TestDoNoRetryConfigRunsOnce(t *testing.T) {
+	calls := 0
+	_, err := Do(context.Background(), NoRetryConfig(), func() (int, error) {
+		calls++
+		return 0, apperrors.ErrServiceUnavailable
+	})
+	if err == nil || calls != 1 {
+		t.Fatalf("calls=%d err=%v", calls, err)
+	}
+}
+
+func TestDoZeroAttemptsStillRunsOnce(t *testing.T) {
+	calls := 0
+	v, err := Do(context.Background(), Config{}, func() (int, error) {
+		calls++
+		return 7, nil
+	})
+	if err != nil || v != 7 || calls != 1 {
+		t.Fatalf("v=%d calls=%d err=%v", v, calls, err)
+	}
+}
+
+func TestDoDeadlinePreservesErrTimeout(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	cfg := Config{MaxAttempts: 5, InitialDelay: time.Second, MaxDelay: time.Second, Multiplier: 1}
+	_, err := Do(ctx, cfg, func() (int, error) { return 0, apperrors.ErrServiceUnavailable })
+	if !apperrors.IsTimeout(err) {
+		t.Fatalf("expected ErrTimeout, got %v", err)
+	}
+}
+
+func TestJitterWithinBounds(t *testing.T) {
+	for i := 0; i < 1000; i++ {
+		d := jitter(100 * time.Millisecond)
+		if d < 50*time.Millisecond || d > 100*time.Millisecond {
+			t.Fatalf("jitter out of range: %v", d)
+		}
+	}
+}

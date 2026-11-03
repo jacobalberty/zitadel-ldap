@@ -71,7 +71,8 @@ func (q *querier) Login(ctx context.Context, username, password string) (bool, e
 		}
 
 		// Use retry logic for session creation
-		retryConfig := retry.DefaultConfig()
+		// Creating a session is not idempotent; do not retry.
+		retryConfig := retry.NoRetryConfig()
 		sesRes, err := retry.Do(ctx, retryConfig, func() (*session.CreateSessionResponse, error) {
 			resp, err := sessionClient.CreateSession(ctx, sesReq)
 			if err != nil {

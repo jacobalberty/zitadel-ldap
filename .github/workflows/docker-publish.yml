@@ -10,10 +10,15 @@ on:
     - cron: '40 12 * * *'
   push:
     branches: [ "main" ]
-    # Publish semver tags as releases.
-    tags: [ 'v*.*.*' ]
   pull_request:
     branches: [ "main" ]
+  # Called by release.yml, which owns tag handling (tag pushes and manual dispatch).
+  workflow_call:
+    inputs:
+      version:
+        description: 'Release version to tag the image with (vX.Y.Z)'
+        type: string
+        required: true
 
 env:
   # Use docker.io for Docker Hub if empty
@@ -36,6 +41,9 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          # When called from the release workflow, build the release tag itself
+          ref: ${{ inputs.version || github.ref }}
 
       # Install the cosign tool except on PR
       # https://github.com/sigstore/cosign-installer
@@ -70,9 +78,9 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
             type=raw,value=latest,enable=${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}
-            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{version}},value=${{ inputs.version }}
+            type=semver,pattern={{major}},value=${{ inputs.version }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ inputs.version }}
             type=ref,event=branch
 
       # Build and push Docker image with Buildx (don't push on PR)

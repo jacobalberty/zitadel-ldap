@@ -7,7 +7,6 @@ import (
 	userv2 "github.com/zitadel/zitadel-go/v3/pkg/client/zitadel/user/v2"
 
 	"github.com/jacobalberty/zitadel-ldap/internal/retry"
-	"github.com/jacobalberty/zitadel-ldap/internal/stores/cache"
 	zclient "github.com/jacobalberty/zitadel-ldap/internal/zitadel"
 )
 
@@ -88,7 +87,9 @@ func (q *querier) CreateUser(ctx context.Context, req *zclient.UserCreateRequest
 	}
 
 	// Execute the request with retry
-	retryConfig := retry.DefaultConfig()
+	// CreateUser is not idempotent: a retry after a lost response would fail
+	// with AlreadyExists even though the first attempt succeeded.
+	retryConfig := retry.NoRetryConfig()
 	resp, err := retry.Do(ctx, retryConfig, func() (*userv2.CreateUserResponse, error) {
 		resp, callErr := q.zitadelClient.UserServiceV2().CreateUser(ctx, createReq)
 		if callErr != nil {
@@ -105,7 +106,7 @@ func (q *querier) CreateUser(ctx context.Context, req *zclient.UserCreateRequest
 	}
 
 	// Invalidate users cache by creating a new cache instance
-	q.usersCache = cache.NewCacher[CacheKey, *zclient.UserResults]()
+	q.usersCache.Clear()
 
 	// Build simplified user response
 	return &zclient.User{
@@ -132,8 +133,14 @@ func (q *querier) UpdateUser(ctx context.Context, userID string, req *zclient.Us
 		return fmt.Errorf("user ID cannot be empty")
 	}
 
-	// Cached logins may be stale after any (even partially failed) update.
-	defer q.loginCache.Clear()
+	// Zitadel may have changed even if a later step fails, so always
+	// invalidate on exit.
+	defer func() {
+		q.loginCache.Clear()
+		q.usersCache.Clear()
+		q.metadataCache.Clear()
+		q.grantsCache.Clear()
+	}()
 
 	// Build the Zitadel request
 	updateReq := &userv2.UpdateUserRequest{
@@ -223,19 +230,19 @@ func (q *querier) UpdateUser(ctx context.Context, userID string, req *zclient.Us
 		}
 	}
 
-	// Handle metadata updates
+	// Handle metadata updates in a single batched call
 	if len(req.Metadata) > 0 {
+		entries := make([]*userv2.Metadata, 0, len(req.Metadata))
 		for key, value := range req.Metadata {
-			if err := q.UpdateMetadata(ctx, userID, key, value); err != nil {
-				return fmt.Errorf("failed to update metadata %s: %w", key, err)
+			if key == "" {
+				return fmt.Errorf("metadata key cannot be empty")
 			}
+			entries = append(entries, &userv2.Metadata{Key: key, Value: value})
+		}
+		if err := q.setMetadata(ctx, userID, entries); err != nil {
+			return fmt.Errorf("failed to update metadata: %w", err)
 		}
 	}
-
-	// Invalidate caches
-	q.loginCache.Clear()
-	q.usersCache = cache.NewCacher[CacheKey, *zclient.UserResults]()
-	q.metadataCache = cache.NewCacher[CacheKey, *zclient.MetadataResults]()
 
 	return nil
 }
@@ -264,9 +271,9 @@ func (q *querier) DeleteUser(ctx context.Context, userID string) error {
 
 	// Invalidate caches
 	q.loginCache.Clear()
-	q.usersCache = cache.NewCacher[CacheKey, *zclient.UserResults]()
-	q.grantsCache = cache.NewCacher[CacheKey, *zclient.GrantResults]()
-	q.metadataCache = cache.NewCacher[CacheKey, *zclient.MetadataResults]()
+	q.usersCache.Clear()
+	q.grantsCache.Clear()
+	q.metadataCache.Clear()
 
 	return nil
 }
@@ -290,7 +297,7 @@ func (q *querier) SetUserPassword(ctx context.Context, userID, password string) 
 		// No verification means admin privileges are required
 	}
 
-	retryConfig := retry.DefaultConfig()
+	retryConfig := retry.NoRetryConfig()
 	_, err := retry.Do(ctx, retryConfig, func() (*userv2.SetPasswordResponse, error) {
 		resp, callErr := q.zitadelClient.UserServiceV2().SetPassword(ctx, setPasswordReq)
 		if callErr != nil {
@@ -316,13 +323,14 @@ func (q *querier) UpdateMetadata(ctx context.Context, userID, key string, value 
 	if key == "" {
 		return fmt.Errorf("metadata key cannot be empty")
 	}
+	return q.setMetadata(ctx, userID, []*userv2.Metadata{{Key: key, Value: value}})
+}
 
-	metadata := []*userv2.Metadata{
-		{
-			Key:   key,
-			Value: value, // Value is already []byte
-		},
-	}
+// setMetadata writes one or more metadata entries in a single request and
+// invalidates the metadata cache. SetUserMetadata is idempotent (upsert).
+func (q *querier) setMetadata(ctx context.Context, userID string, metadata []*userv2.Metadata) error {
+	// Invalidate on exit: a failed batch may still have been applied.
+	defer q.metadataCache.Clear()
 
 	setMetadataReq := &userv2.SetUserMetadataRequest{
 		UserId:   userID,
@@ -340,10 +348,6 @@ func (q *querier) UpdateMetadata(ctx context.Context, userID, key string, value 
 	if err != nil {
 		return fmt.Errorf("failed to set metadata: %w", err)
 	}
-
-	// Invalidate metadata cache
-	q.metadataCache = cache.NewCacher[CacheKey, *zclient.MetadataResults]()
-
 	return nil
 }
 

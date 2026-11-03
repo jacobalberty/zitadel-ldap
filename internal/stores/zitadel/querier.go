@@ -2,6 +2,9 @@ package zitadel
 
 import (
 	"context"
+	"os"
+	"strconv"
+	"time"
 
 	"github.com/zitadel/zitadel-go/v3/pkg/client"
 
@@ -35,14 +38,42 @@ type querier struct {
 	metadataCache cache.Cacher[CacheKey, *zclient.MetadataResults]
 }
 
+// Cache tuning (environment):
+//
+//	ZITADEL_LDAP_CACHE_TTL            data cache lifetime, Go duration (default 1h)
+//	ZITADEL_LDAP_METADATA_CACHE_SIZE  per-user metadata entries (default 10000)
+//	ZITADEL_LDAP_ROLES_CACHE_SIZE     per-project role entries (default 1000)
+const (
+	defaultDataCacheTTL      = time.Hour
+	defaultMetadataCacheSize = 10000
+	defaultRolesCacheSize    = 1000
+)
+
+func envDuration(name string, def time.Duration) time.Duration {
+	if d, err := time.ParseDuration(os.Getenv(name)); err == nil && d > 0 {
+		return d
+	}
+	return def
+}
+
+func envInt(name string, def int) int {
+	if n, err := strconv.Atoi(os.Getenv(name)); err == nil && n > 0 {
+		return n
+	}
+	return def
+}
+
 func newQuerier(client *client.Client) Querier {
+	ttl := envDuration("ZITADEL_LDAP_CACHE_TTL", defaultDataCacheTTL)
 	return &querier{
 		zitadelClient: client,
 		loginCache:    cache.NewCacher(cache.WithTTL[CacheKey, bool](loginCacheTTL()), cache.WithCapacity[CacheKey, bool](1000)),
-		usersCache:    cache.NewCacher[CacheKey, *zclient.UserResults](),
-		grantsCache:   cache.NewCacher[CacheKey, *zclient.GrantResults](),
-		projectsCache: cache.NewCacher[CacheKey, *zclient.ProjectResults](),
-		rolesCache:    cache.NewCacher[CacheKey, *zclient.RoleResults](),
-		metadataCache: cache.NewCacher[CacheKey, *zclient.MetadataResults](),
+		usersCache:    cache.NewCacher(cache.WithTTL[CacheKey, *zclient.UserResults](ttl)),
+		grantsCache:   cache.NewCacher(cache.WithTTL[CacheKey, *zclient.GrantResults](ttl)),
+		projectsCache: cache.NewCacher(cache.WithTTL[CacheKey, *zclient.ProjectResults](ttl)),
+		rolesCache: cache.NewCacher(cache.WithTTL[CacheKey, *zclient.RoleResults](ttl),
+			cache.WithCapacity[CacheKey, *zclient.RoleResults](envInt("ZITADEL_LDAP_ROLES_CACHE_SIZE", defaultRolesCacheSize))),
+		metadataCache: cache.NewCacher(cache.WithTTL[CacheKey, *zclient.MetadataResults](ttl),
+			cache.WithCapacity[CacheKey, *zclient.MetadataResults](envInt("ZITADEL_LDAP_METADATA_CACHE_SIZE", defaultMetadataCacheSize))),
 	}
 }

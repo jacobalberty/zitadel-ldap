@@ -3,6 +3,7 @@ package handler
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"net"
@@ -199,7 +200,7 @@ func (z *zitadelHandler) Bind(bindDN, bindSimplePw string, conn net.Conn) (code 
 			z.log.Info().Str("user", user).Msg("Invalid credentials")
 			return ldap.LDAPResultInvalidCredentials, nil
 		}
-		if apperrors.IsTimeout(err) {
+		if apperrors.IsTimeout(err) || errors.Is(err, context.DeadlineExceeded) {
 			z.log.Error().Err(err).Str("user", user).Msg("Login timeout")
 			return ldap.LDAPResultBusy, fmt.Errorf("authentication timeout: %w", err)
 		}

@@ -24,10 +24,6 @@ func (f *fakeCacher[K, V]) Get(ctx context.Context, key K, loaderFunc cache.Load
 	return f.value, nil
 }
 
-func (f *fakeCacher[K, V]) GetMany(ctx context.Context, keys []K, loaderFunc cache.LoaderFunc[map[K]V]) (map[K]V, error) {
-	return map[K]V{}, nil
-}
-
 func (f *fakeCacher[K, V]) Clear() {}
 
 func TestListUsersUsesCacheKey(t *testing.T) {

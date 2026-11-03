@@ -1,1 +1,6 @@
 bin/
+
+# local build artifacts / scratch
+coverage.out
+config-setup.cfg
+.vscode/

@@ -34,13 +34,13 @@ func (q *querier) CreateUser(ctx context.Context, req *zclient.UserCreateRequest
 						}
 						switch req.Gender {
 						case "male":
-							return ptr(userv2.Gender_GENDER_MALE)
+							return new(userv2.Gender_GENDER_MALE)
 						case "female":
-							return ptr(userv2.Gender_GENDER_FEMALE)
+							return new(userv2.Gender_GENDER_FEMALE)
 						case "diverse":
-							return ptr(userv2.Gender_GENDER_DIVERSE)
+							return new(userv2.Gender_GENDER_DIVERSE)
 						default:
-							return ptr(userv2.Gender_GENDER_UNSPECIFIED)
+							return new(userv2.Gender_GENDER_UNSPECIFIED)
 						}
 					}(),
 				},
@@ -83,7 +83,7 @@ func (q *querier) CreateUser(ctx context.Context, req *zclient.UserCreateRequest
 				Value: value, // Value is already []byte
 			})
 		}
-		createReq.GetHuman().Metadata = metadata
+		createReq.GetHuman().Metadata = metadata //nolint:staticcheck // SA1019: migrating to root-level metadata is a separate API change
 	}
 
 	// Execute the request with retry
@@ -166,13 +166,13 @@ func (q *querier) UpdateUser(ctx context.Context, userID string, req *zclient.Us
 		if req.Gender != nil {
 			switch *req.Gender {
 			case "male":
-				humanUpdate.Human.Profile.Gender = ptr(userv2.Gender_GENDER_MALE)
+				humanUpdate.Human.Profile.Gender = new(userv2.Gender_GENDER_MALE)
 			case "female":
-				humanUpdate.Human.Profile.Gender = ptr(userv2.Gender_GENDER_FEMALE)
+				humanUpdate.Human.Profile.Gender = new(userv2.Gender_GENDER_FEMALE)
 			case "diverse":
-				humanUpdate.Human.Profile.Gender = ptr(userv2.Gender_GENDER_DIVERSE)
+				humanUpdate.Human.Profile.Gender = new(userv2.Gender_GENDER_DIVERSE)
 			default:
-				humanUpdate.Human.Profile.Gender = ptr(userv2.Gender_GENDER_UNSPECIFIED)
+				humanUpdate.Human.Profile.Gender = new(userv2.Gender_GENDER_UNSPECIFIED)
 			}
 		}
 		needsUpdate = true
@@ -299,7 +299,7 @@ func (q *querier) SetUserPassword(ctx context.Context, userID, password string) 
 
 	retryConfig := retry.NoRetryConfig()
 	_, err := retry.Do(ctx, retryConfig, func() (*userv2.SetPasswordResponse, error) {
-		resp, callErr := q.zitadelClient.UserServiceV2().SetPassword(ctx, setPasswordReq)
+		resp, callErr := q.zitadelClient.UserServiceV2().SetPassword(ctx, setPasswordReq) //nolint:staticcheck // SA1019: UpdateUser-based password change is a separate API migration
 		if callErr != nil {
 			return nil, classifyError("SetPassword", callErr)
 		}
@@ -349,9 +349,4 @@ func (q *querier) setMetadata(ctx context.Context, userID string, metadata []*us
 		return fmt.Errorf("failed to set metadata: %w", err)
 	}
 	return nil
-}
-
-// ptr is a helper function to get a pointer to a value
-func ptr[T any](v T) *T {
-	return &v
 }

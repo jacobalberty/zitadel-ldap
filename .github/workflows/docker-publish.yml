@@ -28,8 +28,15 @@ env:
 
 
 jobs:
-  build:
+  # Only build and publish images from code that passes vet, race tests,
+  # go fix, lint and govulncheck.
+  ci:
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
 
+  build:
+    needs: ci
     runs-on: ubuntu-latest
     permissions:
       contents: read

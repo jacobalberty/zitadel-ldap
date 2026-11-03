@@ -115,5 +115,5 @@ func jitter(d time.Duration) time.Duration {
 		return d
 	}
 	half := d / 2
-	return half + time.Duration(rand.Int64N(int64(d-half)+1))
+	return half + time.Duration(rand.Int64N(int64(d-half)+1)) //nolint:gosec // retry jitter needs no cryptographic randomness
 }

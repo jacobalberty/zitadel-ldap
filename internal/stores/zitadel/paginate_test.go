@@ -22,10 +22,7 @@ type cappedGrantService struct {
 func (f *cappedGrantService) ListUserGrants(ctx context.Context, req *management.ListUserGrantRequest, opts ...grpc.CallOption) (*management.ListUserGrantResponse, error) {
 	f.calls++
 	off := int(req.Query.Offset)
-	end := min(off+int(req.Query.Limit), off+f.cap)
-	if end > f.total {
-		end = f.total
-	}
+	end := min(min(off+int(req.Query.Limit), off+f.cap), f.total)
 	var res []*user.UserGrant
 	for i := off; i < end; i++ {
 		res = append(res, &user.UserGrant{UserId: fmt.Sprintf("u%d", i)})

@@ -661,7 +661,7 @@ func (z *zitadelHandler) dynamicGroupEntries(ctx context.Context, hierarchy stri
 
 func (z *zitadelHandler) hash(s string) int {
 	h := fnv.New32a()
-	h.Write([]byte(s))
+	_, _ = h.Write([]byte(s)) // hash.Hash.Write never returns an error
 	return int(h.Sum32())
 }
 

@@ -5,16 +5,61 @@ import (
 	"fmt"
 	"net"
 	"reflect"
+	"regexp"
 	"strings"
 
 	"github.com/glauth/ldap"
+	apperrors "github.com/jacobalberty/zitadel-ldap/internal/errors"
 	zclient "github.com/jacobalberty/zitadel-ldap/internal/zitadel"
 )
 
+// reservedAttrs are attributes the handler synthesizes in search results (or
+// that are structural). Writing them as custom metadata would let a writer
+// shadow built-in values (e.g. uidNumber, memberOf) in FindPosixAccounts.
+var reservedAttrs = map[string]bool{
+	"uid": true, "cn": true, "uidnumber": true, "gidnumber": true, "memberof": true,
+	"homedirectory": true, "loginshell": true, "accountstatus": true,
+	"userprincipalname": true, "description": true, "gecos": true, "ou": true,
+	"shadowexpire": true, "shadowflag": true, "shadowinactive": true,
+	"shadowlastchange": true, "shadowmax": true, "shadowmin": true, "shadowwarning": true,
+	"dn": true, "entrydn": true, "subschemasubentry": true,
+}
+
+// hashedPasswordPrefix matches RFC 2307 scheme prefixes such as {SSHA}.
+var hashedPasswordPrefix = regexp.MustCompile(`^\{[A-Za-z0-9._-]+\}`)
+
+// validateAttribute rejects values that must not be accepted.
+func validateAttribute(attrType string, attrVals []string) error {
+	lower := strings.ToLower(attrType)
+	if lower == "userpassword" && len(attrVals) > 0 && hashedPasswordPrefix.MatchString(attrVals[0]) {
+		return fmt.Errorf("pre-hashed userPassword is not supported; send the plaintext password")
+	}
+	return nil
+}
+
+// metadataKey returns the Zitadel metadata key for a custom LDAP attribute,
+// or "" if the attribute may not be stored as metadata.
+func metadataKey(attrType string) string {
+	lower := strings.ToLower(attrType)
+	if strings.HasPrefix(lower, "object") || reservedAttrs[lower] {
+		return ""
+	}
+	// An explicit gl_ prefix names the metadata key directly (README:
+	// metadata "gl_test" is exposed as attribute "test").
+	lower = strings.TrimPrefix(lower, "gl_")
+	if lower == "" || reservedAttrs[lower] {
+		return ""
+	}
+	return "gl_" + lower
+}
+
 // processLDAPAttributes maps LDAP attributes to Zitadel user update request fields
-func (z *zitadelHandler) processLDAPAttributes(attrType string, attrVals []string, updateReq *zclient.UserUpdateRequest) {
+func (z *zitadelHandler) processLDAPAttributes(attrType string, attrVals []string, updateReq *zclient.UserUpdateRequest) error {
 	if len(attrVals) == 0 {
-		return
+		return nil
+	}
+	if err := validateAttribute(attrType, attrVals); err != nil {
+		return err
 	}
 	value := attrVals[0]
 
@@ -36,19 +81,22 @@ func (z *zitadelHandler) processLDAPAttributes(attrType string, attrVals []strin
 	case "telephonenumber", "phone":
 		updateReq.Phone = &value
 	default:
-		// Store other attributes as metadata with "gl_" prefix
-		if strings.HasPrefix(strings.ToLower(attrType), "gl_") ||
-			!strings.HasPrefix(strings.ToLower(attrType), "object") {
-			key := "gl_" + strings.ToLower(attrType)
-			updateReq.Metadata[key] = []byte(value)
+		key := metadataKey(attrType)
+		if key == "" {
+			return fmt.Errorf("attribute %q cannot be modified", attrType)
 		}
+		updateReq.Metadata[key] = []byte(value)
 	}
+	return nil
 }
 
 // processCreateAttributes maps LDAP attributes to create user request
-func (z *zitadelHandler) processCreateAttributes(attrType string, attrVals []string, createReq *zclient.UserCreateRequest) {
+func (z *zitadelHandler) processCreateAttributes(attrType string, attrVals []string, createReq *zclient.UserCreateRequest) error {
 	if len(attrVals) == 0 {
-		return
+		return nil
+	}
+	if err := validateAttribute(attrType, attrVals); err != nil {
+		return err
 	}
 	value := attrVals[0]
 
@@ -70,13 +118,16 @@ func (z *zitadelHandler) processCreateAttributes(attrType string, attrVals []str
 	case "telephonenumber", "phone":
 		createReq.Phone = value
 	default:
-		// Store other attributes as metadata with "gl_" prefix
-		if strings.HasPrefix(strings.ToLower(attrType), "gl_") ||
-			!strings.HasPrefix(strings.ToLower(attrType), "object") {
-			key := "gl_" + strings.ToLower(attrType)
+		lower := strings.ToLower(attrType)
+		// Entry-structure attributes sent with every Add are ignored, not errors.
+		if strings.HasPrefix(lower, "object") || reservedAttrs[lower] {
+			return nil
+		}
+		if key := metadataKey(attrType); key != "" {
 			createReq.Metadata[key] = []byte(value)
 		}
 	}
+	return nil
 }
 
 // extractAddRequestFields reads the unexported fields of ldap.AddRequest via
@@ -158,7 +209,10 @@ func (z *zitadelHandler) Add(boundDN string, req ldap.AddRequest, conn net.Conn)
 	// Process attributes
 	for _, attr := range attrs {
 		attrType, attrVals := z.getAttributeTypeAndVals(attr)
-		z.processCreateAttributes(attrType, attrVals, createReq)
+		if err := z.processCreateAttributes(attrType, attrVals, createReq); err != nil {
+			z.log.Warn().Err(err).Str("username", username).Str("attr", attrType).Msg("Rejected attribute in Add")
+			return ldap.LDAPResultConstraintViolation, err
+		}
 	}
 
 	// Validate required fields
@@ -178,6 +232,10 @@ func (z *zitadelHandler) Add(boundDN string, req ldap.AddRequest, conn net.Conn)
 	// Create the user
 	user, err := z.repository.CreateUser(ctx, createReq)
 	if err != nil {
+		if apperrors.IsAlreadyExists(err) {
+			z.log.Warn().Str("username", username).Msg("User already exists")
+			return ldap.LDAPResultEntryAlreadyExists, fmt.Errorf("user already exists: %s", username)
+		}
 		z.log.Error().Err(err).Str("username", username).Msg("Failed to create user")
 		return ldap.LDAPResultOperationsError, fmt.Errorf("failed to create user: %w", err)
 	}
@@ -220,17 +278,24 @@ func (z *zitadelHandler) Modify(boundDN string, req ldap.ModifyRequest, conn net
 
 	user := userResults.Result[0]
 
+	// Attribute deletion is not implemented. Silently returning success would
+	// tell the client the attribute is gone when it is not.
+	if len(req.DeleteAttributes) > 0 {
+		z.log.Warn().Str("username", username).Msg("Modify with delete operations is not supported")
+		return ldap.LDAPResultUnwillingToPerform, fmt.Errorf("deleting attributes is not supported")
+	}
+
 	// Build update request from modifications
 	updateReq := &zclient.UserUpdateRequest{
 		Metadata: make(map[string][]byte),
 	}
 
 	// Process add and replace attributes
-	for _, attr := range req.AddAttributes {
-		z.processLDAPAttributes(attr.AttrType, attr.AttrVals, updateReq)
-	}
-	for _, attr := range req.ReplaceAttributes {
-		z.processLDAPAttributes(attr.AttrType, attr.AttrVals, updateReq)
+	for _, attr := range append(append([]ldap.PartialAttribute{}, req.AddAttributes...), req.ReplaceAttributes...) {
+		if err := z.processLDAPAttributes(attr.AttrType, attr.AttrVals, updateReq); err != nil {
+			z.log.Warn().Err(err).Str("username", username).Str("attr", attr.AttrType).Msg("Rejected attribute in Modify")
+			return ldap.LDAPResultConstraintViolation, err
+		}
 	}
 
 	// Update the user

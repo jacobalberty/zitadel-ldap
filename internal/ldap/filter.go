@@ -2,6 +2,7 @@ package ldap
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/go-ldap/ldap/v3"
@@ -256,6 +257,11 @@ func matchSimpleFilter(filter string, attributes map[string][]string) (bool, err
 	if attr == "" {
 		return false, fmt.Errorf("empty attribute in filter: %s", filter)
 	}
+	// Ordering/approximate matches are valid LDAP but not implemented here.
+	// Fail loudly rather than silently evaluating to "no match".
+	if last := attr[len(attr)-1]; last == '>' || last == '<' || last == '~' || last == ':' {
+		return false, fmt.Errorf("unsupported filter operator in %q (only =, presence and substring are supported)", filter)
+	}
 
 	values := attributes[attr]
 	if len(values) == 0 {
@@ -270,16 +276,17 @@ func matchSimpleFilter(filter string, attributes map[string][]string) (bool, err
 	// Substring filter
 	if strings.Contains(value, "*") {
 		for _, v := range values {
-			if wildcardMatch(v, value) {
+			if wildcardMatch(strings.ToLower(v), strings.ToLower(value)) {
 				return true, nil
 			}
 		}
 		return false, nil
 	}
 
-	// Equality filter
+	// Equality filter (case-insensitive, like most LDAP string attributes)
+	value = unescapeFilterValue(value)
 	for _, v := range values {
-		if v == value {
+		if strings.EqualFold(v, value) {
 			return true, nil
 		}
 	}
@@ -320,4 +327,25 @@ func wildcardMatch(value, pattern string) bool {
 	}
 
 	return true
+}
+
+// unescapeFilterValue decodes RFC 4515 \XX hex escapes. Escapes other than
+// a literal '*' (\2a) are decoded here; callers handle unescaped '*' before
+// calling this, so values reaching it contain no wildcards.
+func unescapeFilterValue(v string) string {
+	if !strings.Contains(v, `\`) {
+		return v
+	}
+	var b strings.Builder
+	for i := 0; i < len(v); i++ {
+		if v[i] == '\\' && i+2 < len(v) {
+			if n, err := strconv.ParseUint(v[i+1:i+3], 16, 8); err == nil {
+				b.WriteByte(byte(n))
+				i += 2
+				continue
+			}
+		}
+		b.WriteByte(v[i])
+	}
+	return b.String()
 }

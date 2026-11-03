@@ -222,8 +222,8 @@ func TestClassifyError_DataLoss_Permanent(t *testing.T) {
 }
 
 func TestClassifyError_UnknownCode(t *testing.T) {
-	// Use a less common code
-	grpcErr := status.Error(codes.Aborted, "aborted")
+	// Use a code with no specific mapping
+	grpcErr := status.Error(codes.Unimplemented, "unimplemented")
 	err := classifyError("test", grpcErr)
 	if err == nil {
 		t.Fatal("expected error")
@@ -268,5 +268,28 @@ func TestClassifyLoginError_Unavailable(t *testing.T) {
 	}
 	if !apperrors.IsRetryable(err) {
 		t.Fatal("expected retryable error for unavailable service")
+	}
+}
+
+func TestClassifyError_AlreadyExistsAndAborted(t *testing.T) {
+	err := classifyError("test", status.Error(codes.AlreadyExists, "dup"))
+	if !apperrors.IsAlreadyExists(err) || apperrors.IsRetryable(err) {
+		t.Fatalf("AlreadyExists must map to ErrAlreadyExists, non-retryable: %v", err)
+	}
+	err = classifyError("test", status.Error(codes.Aborted, "conflict"))
+	if !apperrors.IsRetryable(err) {
+		t.Fatalf("Aborted should be retryable: %v", err)
+	}
+}
+
+func TestClassifyLoginError_RejectionCodesAreInvalidCredentials(t *testing.T) {
+	for _, c := range []codes.Code{codes.Unauthenticated, codes.NotFound, codes.PermissionDenied, codes.InvalidArgument, codes.FailedPrecondition} {
+		err := classifyLoginError(status.Error(c, "x"))
+		if !apperrors.IsUnauthorized(err) || apperrors.IsRetryable(err) {
+			t.Errorf("%s must map to non-retryable unauthorized, got %v", c, err)
+		}
+	}
+	if apperrors.IsUnauthorized(classifyLoginError(status.Error(codes.Unavailable, "down"))) {
+		t.Error("Unavailable must not be treated as bad credentials")
 	}
 }

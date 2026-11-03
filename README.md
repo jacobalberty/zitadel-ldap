@@ -49,10 +49,17 @@ Writes also require the bound user to have the `cap_write` metadata (value `*`),
 `cn=<user>,ou=users,<baseDN>`. Writes act with the service account's privileges, so grant `cap_write` sparingly.
 Empty-password binds are rejected.
 
+`Modify` supports add/replace only (delete operations return `unwillingToPerform`). Built-in attributes such as
+`uidNumber`, `memberOf` or `uid` cannot be written, pre-hashed `userPassword` values (`{SSHA}...`) are rejected, and
+any other attribute is stored as `gl_<name>` metadata.
+
 ### Dynamic groups (filter-based)
 
 You can define dynamic groups in the config by attaching a `dynamicFilter` capability to a group.
 The filter is evaluated against user attributes and decoded metadata (including `gl_` keys).
+Supported: `&`, `|`, `!`, equality (case-insensitive), presence (`attr=*`) and substring matches. Ordering
+(`>=`, `<=`) and approximate (`~=`) filters are not supported; a group using them is ignored with a warning.
+Matching users appear in the group's members and in their `memberOf`.
 
 Example:
 

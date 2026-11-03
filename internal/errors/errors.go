@@ -19,6 +19,9 @@ var (
 	// ErrInvalidInput indicates invalid input parameters
 	ErrInvalidInput = errors.New("invalid input")
 
+	// ErrAlreadyExists indicates the resource already exists
+	ErrAlreadyExists = errors.New("resource already exists")
+
 	// ErrServiceUnavailable indicates the Zitadel service is temporarily unavailable
 	ErrServiceUnavailable = errors.New("service unavailable")
 
@@ -82,4 +85,14 @@ func IsUnauthorized(err error) bool {
 // IsTimeout checks if an error indicates a timeout
 func IsTimeout(err error) bool {
 	return errors.Is(err, ErrTimeout)
+}
+
+// IsAlreadyExists checks if an error indicates the resource already exists
+func IsAlreadyExists(err error) bool {
+	return errors.Is(err, ErrAlreadyExists)
+}
+
+// IsForbidden checks if an error indicates a permission failure
+func IsForbidden(err error) bool {
+	return errors.Is(err, ErrForbidden)
 }

@@ -17,7 +17,15 @@ type dynamicGroupDefinition struct {
 	filters   []string
 }
 
+// dynamicGroupDefinitions returns the validated dynamic group definitions.
+// The result is computed once: filters come from static config, and doing it
+// per user would re-validate and re-log on every entry.
 func (z *zitadelHandler) dynamicGroupDefinitions() []dynamicGroupDefinition {
+	z.dynOnce.Do(func() { z.dynDefs = z.buildDynamicGroupDefinitions() })
+	return z.dynDefs
+}
+
+func (z *zitadelHandler) buildDynamicGroupDefinitions() []dynamicGroupDefinition {
 	if z.options.Config == nil {
 		return nil
 	}
@@ -26,6 +34,12 @@ func (z *zitadelHandler) dynamicGroupDefinitions() []dynamicGroupDefinition {
 	for _, group := range z.options.Config.Groups {
 		filters := dynamicGroupFiltersFromCapabilities(group.Capabilities)
 		if len(filters) == 0 {
+			continue
+		}
+		// Evaluate against an empty entry to surface syntax errors and
+		// unsupported operators once, instead of failing every search.
+		if _, err := ldaputil.MatchAnyFilter(filters, nil); err != nil {
+			z.log.Warn().Err(err).Str("group", group.Name).Msg("Ignoring dynamic group with invalid filter")
 			continue
 		}
 
@@ -107,8 +121,7 @@ func (z *zitadelHandler) dynamicMemberOf(u zclient.User, metadata *zclient.Metad
 			return nil, err
 		}
 		if matched {
-			dn := ldaputil.SafeConstructDNWithAttr(z.options.Backend.GroupFormat, def.name, "ou=groups", z.baseDN)
-			groups = append(groups, dn)
+			groups = append(groups, z.buildDN(z.options.Backend.GroupFormat, def.name, "ou=groups"))
 		}
 	}
 
@@ -154,7 +167,9 @@ func (z *zitadelHandler) userAttributesForFilter(u zclient.User, metadata *zclie
 	for _, m := range metadata.Result {
 		value, err := base64.StdEncoding.DecodeString(string(m.Value))
 		if err != nil {
-			return nil, fmt.Errorf("failed to decode metadata %s: %w", m.Key, err)
+			// One malformed metadata row must not break the whole lookup.
+			z.log.Warn().Str("user", u.Username).Str("key", m.Key).Msg("Skipping metadata with invalid base64 value")
+			continue
 		}
 
 		key := strings.ToLower(m.Key)

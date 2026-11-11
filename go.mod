@@ -1,6 +1,6 @@
 module github.com/jacobalberty/zitadel-ldap
 
-go 1.26.0
+go 1.27.0
 
 require (
 	github.com/GeertJohan/yubigo v0.0.0-20190917122436-175bc097e60e

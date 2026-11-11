@@ -61,8 +61,7 @@ func NewZitadelError(operation string, err error, retryable bool) *ZitadelError 
 
 // IsRetryable checks if an error is retryable
 func IsRetryable(err error) bool {
-	var zitErr *ZitadelError
-	if errors.As(err, &zitErr) {
+	if zitErr, ok := errors.AsType[*ZitadelError](err); ok {
 		return zitErr.Retryable
 	}
 

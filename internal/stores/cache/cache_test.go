@@ -55,13 +55,13 @@ func TestNewCacherOptions(t *testing.T) {
 
 func TestGetSingleFlight(t *testing.T) {
 	c := NewCacher[string, int]()
-	var calls int32
+	var calls atomic.Int32
 	release := make(chan struct{})
 	var wg sync.WaitGroup
 	for range 50 {
 		wg.Go(func() {
 			v, err := c.Get(context.Background(), "k", func(ctx context.Context) (int, error) {
-				atomic.AddInt32(&calls, 1)
+				calls.Add(1)
 				<-release
 				return 9, nil
 			})
@@ -73,7 +73,7 @@ func TestGetSingleFlight(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 	close(release)
 	wg.Wait()
-	if n := atomic.LoadInt32(&calls); n != 1 {
+	if n := calls.Load(); n != 1 {
 		t.Fatalf("loader called %d times, want 1", n)
 	}
 }

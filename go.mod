@@ -10,7 +10,7 @@ require (
 	github.com/go-ldap/ldap/v3 v3.4.15
 	github.com/maypok86/otter/v2 v2.4.0
 	github.com/rs/zerolog v1.35.1
-	github.com/zitadel/zitadel-go/v3 v3.30.0
+	github.com/zitadel/zitadel-go/v3 v3.30.1
 	google.golang.org/grpc v1.85.0
 	google.golang.org/protobuf v1.36.12
 )
